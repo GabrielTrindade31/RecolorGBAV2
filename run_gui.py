@@ -1,2 +1,2 @@
-from recolor_rgba_app3.gui_tk_pro import App
-if __name__=='__main__': App().mainloop()
+from recolor_rgba_app_pro.gui_tk_pro import main
+if __name__=='__main__': main()
