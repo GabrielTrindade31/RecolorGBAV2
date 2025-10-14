@@ -84,10 +84,17 @@ class App(tk.Tk):
         self._full_preview_delay_ms = 0
         self._image_serial=0
         self._color_cache=None
+        self.fullres_np=None
+        self._fullres_cache=None
         self._draft_np=None
         self._draft_cache=None
         self._draft_scale=1.0
         self._draft_pixel_cap=1_200_000
+        self._work_pixel_cap=600_000
+        self._min_work_scale=0.05
+        self._work_max_long_edge=520
+        self._working_scale=1.0
+        self._working_downscaled=False
         self._last_preview_quality="full"
 
         geometry = self._prefs.get("geometry", "1400x860")
@@ -385,10 +392,16 @@ class App(tk.Tk):
     def load_original(self):
         p=filedialog.askopenfilename(filetypes=[("Images","*.png;*.jpg;*.jpeg;*.bmp;*.webp")])
         if not p: return
-        im=pil_open(p); npimg=pil_to_np(im); self.orig_np=npimg; H,W,_=npimg.shape
+        im=pil_open(p)
+        npimg_full=pil_to_np(im)
+        self.fullres_np=npimg_full
+        self._fullres_cache=self._build_color_cache(npimg_full)
+        working_np=self._maybe_downscale_for_work(npimg_full)
+        self.orig_np=working_np
+        H,W,_=working_np.shape
         self.mask=Mask(H,W)
-        self._color_cache = self._build_color_cache(npimg)
-        self._setup_preview_buffers(npimg)
+        self._color_cache = self._build_color_cache(working_np)
+        self._setup_preview_buffers(working_np)
         self._last_preview_quality = "full"
         self._image_serial += 1
         if self._preview_worker is not None:
@@ -411,6 +424,13 @@ class App(tk.Tk):
         self._cancel_preview_job()
         self.preview_np=None  # força render original até a primeira preview
         self.preview_dirty=True
+        if self._working_downscaled:
+            pct=int(self._working_scale*100+0.5)
+            self.status.set(
+                f"Trabalhando em pré-visualização a {pct}% (máx. {self._work_max_long_edge}px na borda longa) para manter a resposta rápida. A exportação usa a resolução total."
+            )
+        else:
+            self.status.set("Imagem carregada. Ajuste os controles à direita e use o mouse para editar.")
         self._render_left()
         self.preview(immediate=True)
 
@@ -420,9 +440,17 @@ class App(tk.Tk):
         self.ref_np=pil_to_np(pil_open(p)); self._draw_thumb(self.thumb_ref, self.ref_np); self._clear_palette_swatches()
 
     def save_png(self):
-        if self.preview_np is None or self.preview_dirty: self.preview(immediate=True)
         p=filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG","*.png")])
         if not p: return
+        if self._working_downscaled and self.fullres_np is not None:
+            payload = self._prepare_preview_payload(self.fullres_np, self._fullres_cache)
+            if payload is not None:
+                payload['quality'] = 'full'
+                result = self._compute_preview(payload)
+                np_to_pil(result).save(p)
+                return
+        if self.preview_np is None or self.preview_dirty:
+            self.preview(immediate=True)
         np_to_pil(self.preview_np).save(p)
 
     # thumbnails / render
@@ -468,6 +496,34 @@ class App(tk.Tk):
         self._draft_np = np.array(down, dtype=np.uint8)
         self._draft_cache = self._build_color_cache(self._draft_np)
         self._draft_scale = scale
+
+    def _maybe_downscale_for_work(self, npimg):
+        if npimg is None:
+            self._working_scale = 1.0
+            self._working_downscaled = False
+            return None
+        H,W,_ = npimg.shape
+        total = H * W
+        cap = max(1, int(self._work_pixel_cap))
+        if total <= cap and max(H, W) <= self._work_max_long_edge:
+            self._working_scale = 1.0
+            self._working_downscaled = False
+            return npimg
+        scale = math.sqrt(cap / float(total))
+        long_edge = float(max(H, W))
+        if long_edge > self._work_max_long_edge:
+            scale = min(scale, self._work_max_long_edge / long_edge)
+        scale = max(self._min_work_scale, min(scale, 1.0))
+        new_w = max(1, int(round(W * scale)))
+        new_h = max(1, int(round(H * scale)))
+        if new_w == W and new_h == H:
+            self._working_scale = 1.0
+            self._working_downscaled = False
+            return npimg
+        down = Image.fromarray(npimg, mode="RGBA").resize((new_w, new_h), RESAMPLE_BILINEAR)
+        self._working_scale = new_w / float(W)
+        self._working_downscaled = True
+        return np.array(down, dtype=np.uint8)
 
     def _resample_mask_to(self, mask, target_shape):
         if mask is None:
@@ -797,14 +853,30 @@ class App(tk.Tk):
             self._queue_full_quality(generation)
         if self.orig_np is None or generation != self._preview_generation:
             return
+        payload = self._prepare_preview_payload(image_np, cache)
+        if payload is None:
+            return
+        if mask_shape is not None and payload['mask'] is not None and payload['mask'].shape != mask_shape:
+            payload['mask'] = self._resample_mask_to(payload['mask'], mask_shape)
+        payload['quality'] = requested_quality
+        if blocking or self._preview_worker is None:
+            result = self._compute_preview(payload)
+            self._on_preview_ready(generation, self._image_serial, result, requested_quality)
+        else:
+            payload.update({'generation': generation, 'image_id': self._image_serial})
+            self._preview_worker.schedule(payload)
+
+    def _prepare_preview_payload(self, image_np, cache):
+        if image_np is None:
+            return None
         tgt=(self.r.get(), self.g.get(), self.b.get(), self.a.get())
         mask_to_use=self._resolve_mask()
         mask_copy = None if mask_to_use is None else mask_to_use.astype(np.float32, copy=True)
-        if mask_shape is not None and mask_copy is not None:
-            mask_copy = self._resample_mask_to(mask_copy, mask_shape)
+        if mask_copy is not None and mask_copy.shape != image_np.shape[:2]:
+            mask_copy = self._resample_mask_to(mask_copy, image_np.shape[:2])
         color_threshold=self._current_threshold("include")
         exclude_threshold=self._current_threshold("exclude")
-        payload = {
+        return {
             'image': image_np,
             'target_rgba': tgt,
             'mask': mask_copy,
@@ -816,14 +888,7 @@ class App(tk.Tk):
             'color_threshold': color_threshold,
             'exclude_threshold': exclude_threshold,
             'cache': cache,
-            'quality': requested_quality,
         }
-        if blocking or self._preview_worker is None:
-            result = self._compute_preview(payload)
-            self._on_preview_ready(generation, self._image_serial, result, requested_quality)
-        else:
-            payload.update({'generation': generation, 'image_id': self._image_serial})
-            self._preview_worker.schedule(payload)
 
     def _on_live_preview_toggle(self):
         if not self.live_preview.get():
