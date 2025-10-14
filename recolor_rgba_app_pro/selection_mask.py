@@ -20,36 +20,55 @@ class Mask:
         self.snapshot(); self.alpha[:] = 1.0 - self.alpha
     @staticmethod
     def _cos_ramp(t): return 0.5 - 0.5*np.cos(np.clip(t,0,1)*np.pi)
-    def brush(self, cx, cy, radius, feather, sign=+1.0, shape="circle"):
-        self.snapshot()
-        h,w=self.alpha.shape
-        RR=max(1,int(radius))
-        f=max(0,int(feather))
-        if shape.lower()=="square":
-            y,x=np.ogrid[:h,:w]
-            dist=np.maximum(np.abs(x-cx), np.abs(y-cy))
-            inner=max(0, RR - f)
-            a=np.zeros_like(self.alpha, dtype=np.float32)
-            ring=dist<=RR
-            a[ring]=1.0
-            if RR>inner:
-                soft=(dist>inner)&ring
+    def brush(self, cx, cy, radius, feather, sign=+1.0, shape="circle", snapshot=True):
+        if snapshot:
+            self.snapshot()
+        h, w = self.alpha.shape
+        RR = max(1, int(radius))
+        if RR <= 0:
+            return
+        f = max(0, int(feather))
+        x0 = max(0, cx - RR)
+        x1 = min(w - 1, cx + RR)
+        y0 = max(0, cy - RR)
+        y1 = min(h - 1, cy + RR)
+        if x0 > x1 or y0 > y1:
+            return
+        sub = self.alpha[y0:y1 + 1, x0:x1 + 1]
+        ys = np.arange(y0, y1 + 1, dtype=np.float32) - float(cy)
+        xs = np.arange(x0, x1 + 1, dtype=np.float32) - float(cx)
+        yy, xx = np.meshgrid(ys, xs, indexing="ij")
+        shape_lower = shape.lower()
+        if shape_lower == "square":
+            dist = np.maximum(np.abs(xx), np.abs(yy))
+            ring = dist <= float(RR)
+            if not ring.any():
+                return
+            a = np.zeros_like(sub, dtype=np.float32)
+            a[ring] = 1.0
+            inner = max(0, RR - f)
+            if RR > inner:
+                soft = ring & (dist > float(inner))
                 if soft.any():
-                    t=(dist[soft]-inner)/(RR-inner+1e-6)
-                    a[soft]=self._cos_ramp(1.0 - t)
+                    denom = float(RR - inner) + 1e-6
+                    t = (dist[soft] - float(inner)) / denom
+                    a[soft] = self._cos_ramp(1.0 - t)
         else:
-            y,x=np.ogrid[:h,:w]
-            dist=np.sqrt((x-cx)**2+(y-cy)**2)
-            inner=max(1, RR - f)
-            ring=dist<=RR
-            a=np.zeros_like(self.alpha, dtype=np.float32)
-            a[ring]=1.0
-            if RR>inner:
-                soft=(dist>inner)&ring
+            dist = np.sqrt(xx * xx + yy * yy)
+            ring = dist <= float(RR)
+            if not ring.any():
+                return
+            a = np.zeros_like(sub, dtype=np.float32)
+            a[ring] = 1.0
+            inner = max(1, RR - f)
+            if RR > inner:
+                soft = ring & (dist > float(inner))
                 if soft.any():
-                    t=(dist[soft]-inner)/(RR-inner+1e-6)
-                    a[soft]=self._cos_ramp(1.0 - t)
-        self.alpha=np.clip(self.alpha + sign*a, 0,1)
+                    denom = float(RR - inner) + 1e-6
+                    t = (dist[soft] - float(inner)) / denom
+                    a[soft] = self._cos_ramp(1.0 - t)
+        updated = np.clip(sub + sign * a, 0.0, 1.0)
+        self.alpha[y0:y1 + 1, x0:x1 + 1] = updated
     def _rect_alpha(self, x0,y0,x1,y1, feather):
         h,w=self.alpha.shape
         x0,x1 = int(x0), int(x1); y0,y1=int(y0),int(y1)

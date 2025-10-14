@@ -567,7 +567,7 @@ class App(tk.Tk):
         if self._tool in ("Brush","Eraser"):
             sign=+1.0 if self._tool=="Brush" else -1.0
             shape = self.brush_shape.get() if self._tool=="Brush" else self.eraser_shape.get()
-            self.mask.brush(ix,iy,self.brush_size.get(),self.feather.get(),sign=sign, shape=shape)
+            self.mask.brush(ix,iy,self.brush_size.get(),self.feather.get(),sign=sign, shape=shape, snapshot=True)
             self._render_live_preview()
         elif self._tool=="Wand":
             self.mask.magic_wand(self.orig_np, ix, iy, tolerance=self.tolerance.get(), sign=+1.0)
@@ -582,7 +582,7 @@ class App(tk.Tk):
         if self._tool in ("Brush","Eraser"):
             sign=+1.0 if self._tool=="Brush" else -1.0
             shape = self.brush_shape.get() if self._tool=="Brush" else self.eraser_shape.get()
-            self.mask.brush(ix,iy,self.brush_size.get(),self.feather.get(),sign=sign, shape=shape)
+            self.mask.brush(ix,iy,self.brush_size.get(),self.feather.get(),sign=sign, shape=shape, snapshot=False)
             self._render_live_preview()
         elif self._tool in ("Rect","Ellipse") and self._rubber_bbox is not None:
             self._rubber_bbox=(self._x0,self._y0,ix,iy)
