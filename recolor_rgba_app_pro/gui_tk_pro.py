@@ -5,7 +5,7 @@ from tkinter import ttk, filedialog, colorchooser, messagebox
 from PIL import Image, ImageTk
 import numpy as np
 from .selection_mask import Mask
-from .colorops import recolor_rgba
+from .colorops import recolor_rgba, rgb_to_hsv
 from .palette import extract_palette, transfer_map
 from .io_utils import pil_open, pil_to_np, np_to_pil
 
@@ -21,6 +21,13 @@ class App(tk.Tk):
         self.live_preview=tk.BooleanVar(value=True)
         self.status=tk.StringVar(value="Load an image. Left: draw/select; Right: controls. Scroll=zoom, Right-drag=pan.")
         self._rubber_id=None; self._rubber_bbox=None
+        self.range_enable=tk.BooleanVar(value=False)
+        self.range_h_tol=tk.IntVar(value=25)
+        self.range_s_tol=tk.IntVar(value=20)
+        self.range_v_tol=tk.IntVar(value=20)
+        self.range_info=tk.StringVar(value="Base: –")
+        self.range_base=None; self.range_hsv=None
+        self._range_pick_active=False
         self._build(); self._bind_shortcuts()
 
     def _build(self):
@@ -82,6 +89,24 @@ class App(tk.Tk):
         ttk.Label(hf,text="Soft°").pack(side="left"); tk.Scale(hf,from_=0,to=45,variable=self.hsoft,orient="horizontal",length=120,command=lambda e:self.preview()).pack(side="left",padx=6)
         ttk.Button(hf, text="Reset 0–360", command=self._reset_hue_range).pack(side="left", padx=8)
 
+        rf=ttk.Labelframe(right,text="Color Threshold"); rf.pack(fill="x",pady=6)
+        row=ttk.Frame(rf); row.pack(fill="x",pady=4)
+        ttk.Checkbutton(row,text="Enable",variable=self.range_enable,command=self.preview).pack(side="left",padx=6)
+        self.range_swatch=tk.Canvas(row,width=34,height=34,highlightthickness=1,highlightbackground="#ffffff",bg="#0E1224")
+        self.range_swatch.pack(side="left",padx=6)
+        ttk.Button(row,text="Pick on image",command=self._begin_range_pick).pack(side="left",padx=4)
+        ttk.Button(row,text="Choose…",command=self._choose_range_color).pack(side="left",padx=4)
+        ttk.Label(rf,textvariable=self.range_info).pack(anchor="w",padx=10)
+        sliders=ttk.Frame(rf); sliders.pack(fill="x",pady=4)
+        ttk.Label(sliders,text="Hue ±°").grid(row=0,column=0,sticky="w",padx=4)
+        tk.Scale(sliders,from_=0,to=180,variable=self.range_h_tol,orient="horizontal",length=220,command=lambda e:self._on_range_change()).grid(row=0,column=1,sticky="we",padx=4)
+        ttk.Label(sliders,text="Sat ±%" ).grid(row=1,column=0,sticky="w",padx=4)
+        tk.Scale(sliders,from_=0,to=100,variable=self.range_s_tol,orient="horizontal",length=220,command=lambda e:self._on_range_change()).grid(row=1,column=1,sticky="we",padx=4)
+        ttk.Label(sliders,text="Val ±%" ).grid(row=2,column=0,sticky="w",padx=4)
+        tk.Scale(sliders,from_=0,to=100,variable=self.range_v_tol,orient="horizontal",length=220,command=lambda e:self._on_range_change()).grid(row=2,column=1,sticky="we",padx=4)
+        sliders.grid_columnconfigure(1, weight=1)
+        self._update_range_widgets()
+
         row = ttk.Frame(right); row.pack(fill="x",pady=6)
         self.thumb_orig = tk.Canvas(row, width=260, height=140, bg="#0E1224", highlightthickness=0); self.thumb_orig.pack(side="left", padx=6)
         refblock = ttk.Frame(row); refblock.pack(side="left", padx=6)
@@ -127,6 +152,7 @@ class App(tk.Tk):
         if not p: return
         im=pil_open(p); npimg=pil_to_np(im); self.orig_np=npimg; H,W,_=npimg.shape
         self.mask=Mask(H,W); self.zoom = min(1.0, 820.0/max(1,W)); self.zoom_var.set(self.zoom)
+        self.range_base=None; self.range_hsv=None; self._update_range_widgets(); self._range_pick_active=False
         self._draw_thumb(self.thumb_orig, self.orig_np)  # "ANTES" fixo
         self.preview_np=None  # força render original até a primeira preview
         self._refresh(); self.preview()
@@ -199,6 +225,9 @@ class App(tk.Tk):
     def on_down(self,e):
         if self.orig_np is None or self.mask is None: return
         ix,iy = self._event_to_img_xy(e); self._x0,self._y0 = ix,iy
+        if self._range_pick_active:
+            self._apply_range_sample(ix,iy)
+            return
         if self._tool in ("Brush","Eraser"):
             sign=+1.0 if self._tool=="Brush" else -1.0
             self.mask.brush(ix,iy,self.brush_size.get(),self.feather.get(),sign=sign)
@@ -255,6 +284,60 @@ class App(tk.Tk):
             self.r.set(r); self.g.set(g); self.b.set(b)
             self.preview()
 
+    def _begin_range_pick(self):
+        if self.orig_np is None:
+            messagebox.showinfo("Pick color","Load an image before sampling colors.")
+            return
+        self._range_pick_active=True
+        self.status.set("Click on the image to sample the threshold color.")
+        self.canvas.configure(cursor="dotbox")
+
+    def _choose_range_color(self):
+        rgb,_ = colorchooser.askcolor()
+        if rgb:
+            self._range_pick_active=False
+            self._set_range_base(tuple(map(int,rgb)))
+
+    def _apply_range_sample(self, ix, iy):
+        self._range_pick_active=False
+        self.canvas.configure(cursor="spraycan" if self._tool in ("Brush","Eraser") else "tcross")
+        if self.orig_np is None:
+            return
+        H,W,_ = self.orig_np.shape
+        if not (0 <= ix < W and 0 <= iy < H):
+            self.status.set("Click inside the image to sample.")
+            return
+        rgb = tuple(int(v) for v in self.orig_np[iy,ix,:3])
+        self._set_range_base(rgb)
+        self.status.set(f"Sampled color #{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x} for threshold.")
+
+    def _set_range_base(self, rgb):
+        self.range_base=rgb
+        r,g,b=[v/255.0 for v in rgb]
+        h,s,v=rgb_to_hsv(np.array([r]),np.array([g]),np.array([b]))
+        self.range_hsv=(float(h[0]),float(s[0]),float(v[0]))
+        self._update_range_widgets()
+        self.preview()
+
+    def _update_range_widgets(self):
+        if hasattr(self,'range_swatch') and self.range_swatch is not None:
+            self.range_swatch.delete("all")
+            if self.range_base is None:
+                self.range_swatch.create_rectangle(0,0,34,34, fill="#0E1224", outline="")
+            else:
+                r,g,b=self.range_base
+                self.range_swatch.create_rectangle(0,0,34,34, fill=f"#{r:02x}{g:02x}{b:02x}", outline="")
+        if self.range_hsv is None:
+            self.range_info.set("Base: –")
+        else:
+            hdeg=int(self.range_hsv[0]*360.0+0.5)
+            sper=int(self.range_hsv[1]*100.0+0.5)
+            vper=int(self.range_hsv[2]*100.0+0.5)
+            self.range_info.set(f"Base HSV: {hdeg}° / {sper}% / {vper}%")
+
+    def _on_range_change(self):
+        self.preview()
+
     def _clear_palette_swatches(self):
         for child in list(self.pal_frame.pack_slaves()): child.destroy()
 
@@ -296,9 +379,17 @@ class App(tk.Tk):
                     mask_to_use = base
 
         hue_range=(self.hmin.get(), self.hmax.get()) if self.hr_enable.get() else None
+        color_threshold=None
+        if self.range_enable.get() and self.range_base is not None:
+            color_threshold={
+                "base": self.range_base,
+                "h_tolerance": self.range_h_tol.get(),
+                "s_tolerance": self.range_s_tol.get()/100.0,
+                "v_tolerance": self.range_v_tol.get()/100.0,
+            }
         out=recolor_rgba(self.orig_np, tgt, mask=mask_to_use, keep=self.keep.get(), saturation_scale=self.sat.get(),
                          alpha_mode=self.alpha_mode.get(), hue_range=hue_range, softness_deg=self.hsoft.get(),
-                         tone_blend=self.tone.get(), shade_gamma=self.gamma.get())
+                         tone_blend=self.tone.get(), shade_gamma=self.gamma.get(), color_threshold=color_threshold)
         self.preview_np=out
         self._draw_thumb(self.thumb_res, out)
         # Also update left canvas to reflect new preview
