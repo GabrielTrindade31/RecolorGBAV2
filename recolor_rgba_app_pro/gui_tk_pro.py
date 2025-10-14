@@ -16,6 +16,7 @@ class App(tk.Tk):
         self.configure(bg="#0B1020"); self.geometry("1400x860")
         self._tool="Brush"; self._show_mask=True
         self.orig_np=None; self.ref_np=None; self.mask=None; self.preview_np=None
+        self.preview_dirty=True; self._preview_job=None
         self.zoom = 1.0
         self.apply_only=tk.BooleanVar(value=False)
         self.live_preview=tk.BooleanVar(value=True)
@@ -62,7 +63,7 @@ class App(tk.Tk):
         ttk.Button(lf,text="Load Reference…",command=self.load_reference).pack(side="left",padx=3)
         ttk.Button(lf,text="Save PNG…",command=self.save_png).pack(side="left",padx=3)
         ttk.Checkbutton(lf, text="Apply to selection only", variable=self.apply_only, command=self.preview).pack(side="left", padx=12)
-        ttk.Checkbutton(lf, text="Live preview", variable=self.live_preview, command=self.preview).pack(side="left", padx=12)
+        ttk.Checkbutton(lf, text="Live preview", variable=self.live_preview, command=self._on_live_preview_toggle).pack(side="left", padx=12)
 
         ttk.Label(self, textvariable=self.status).pack(fill="x", side="bottom")
 
@@ -80,14 +81,23 @@ class App(tk.Tk):
         self.tone=tk.DoubleVar(value=0.9); ttk.Label(tf,text="Tone blend").pack(side="left"); tk.Scale(tf,from_=0,to=1,resolution=0.01,variable=self.tone,orient="horizontal",length=180,command=lambda e:self.preview()).pack(side="left",padx=6)
         self.gamma=tk.DoubleVar(value=1.0); ttk.Label(tf,text="Shading γ").pack(side="left"); tk.Scale(tf,from_=0.4,to=2,resolution=0.01,variable=self.gamma,orient="horizontal",length=180,command=lambda e:self.preview()).pack(side="left",padx=6)
 
-        hf=ttk.Labelframe(right,text="Hue Range"); hf.pack(fill="x",pady=6)
-        self.hr_enable=tk.BooleanVar(value=False)
-        ttk.Checkbutton(hf,text="Enable",variable=self.hr_enable,command=self.preview).pack(side="left",padx=6)
-        self.hmin=tk.IntVar(value=0); self.hmax=tk.IntVar(value=360); self.hsoft=tk.IntVar(value=12)
-        ttk.Label(hf,text="Min°").pack(side="left"); tk.Scale(hf,from_=0,to=360,variable=self.hmin,orient="horizontal",length=180,command=lambda e:self.preview()).pack(side="left",padx=6)
-        ttk.Label(hf,text="Max°").pack(side="left"); tk.Scale(hf,from_=0,to=360,variable=self.hmax,orient="horizontal",length=180,command=lambda e:self.preview()).pack(side="left",padx=6)
-        ttk.Label(hf,text="Soft°").pack(side="left"); tk.Scale(hf,from_=0,to=45,variable=self.hsoft,orient="horizontal",length=120,command=lambda e:self.preview()).pack(side="left",padx=6)
-        ttk.Button(hf, text="Reset 0–360", command=self._reset_hue_range).pack(side="left", padx=8)
+        rf=ttk.Labelframe(right,text="Color Threshold"); rf.pack(fill="x",pady=6)
+        row=ttk.Frame(rf); row.pack(fill="x",pady=4)
+        ttk.Checkbutton(row,text="Enable",variable=self.range_enable,command=self.preview).pack(side="left",padx=6)
+        self.range_swatch=tk.Canvas(row,width=34,height=34,highlightthickness=1,highlightbackground="#ffffff",bg="#0E1224")
+        self.range_swatch.pack(side="left",padx=6)
+        ttk.Button(row,text="Pick on image",command=self._begin_range_pick).pack(side="left",padx=4)
+        ttk.Button(row,text="Choose…",command=self._choose_range_color).pack(side="left",padx=4)
+        ttk.Label(rf,textvariable=self.range_info).pack(anchor="w",padx=10)
+        sliders=ttk.Frame(rf); sliders.pack(fill="x",pady=4)
+        ttk.Label(sliders,text="Hue ±°").grid(row=0,column=0,sticky="w",padx=4)
+        tk.Scale(sliders,from_=0,to=180,variable=self.range_h_tol,orient="horizontal",length=220,command=lambda e:self._on_range_change()).grid(row=0,column=1,sticky="we",padx=4)
+        ttk.Label(sliders,text="Sat ±%" ).grid(row=1,column=0,sticky="w",padx=4)
+        tk.Scale(sliders,from_=0,to=100,variable=self.range_s_tol,orient="horizontal",length=220,command=lambda e:self._on_range_change()).grid(row=1,column=1,sticky="we",padx=4)
+        ttk.Label(sliders,text="Val ±%" ).grid(row=2,column=0,sticky="w",padx=4)
+        tk.Scale(sliders,from_=0,to=100,variable=self.range_v_tol,orient="horizontal",length=220,command=lambda e:self._on_range_change()).grid(row=2,column=1,sticky="we",padx=4)
+        sliders.grid_columnconfigure(1, weight=1)
+        self._update_range_widgets()
 
         rf=ttk.Labelframe(right,text="Color Threshold"); rf.pack(fill="x",pady=6)
         row=ttk.Frame(rf); row.pack(fill="x",pady=4)
@@ -134,13 +144,12 @@ class App(tk.Tk):
         self.bind("+", lambda e: self._zoom_step(+0.1)); self.bind("-", lambda e: self._zoom_step(-0.1)); self.bind("0", lambda e: self._reset_zoom())
 
     # helpers
-    def _reset_hue_range(self): self.hmin.set(0); self.hmax.set(360); self.preview()
     def _zoom_step(self, dz):
-        z = max(0.25, min(6.0, self.zoom + dz)); self.zoom_var.set(z); self.zoom = z; self._refresh(); self.preview()
+        z = max(0.25, min(6.0, self.zoom + dz)); self.zoom_var.set(z); self.zoom = z; self._refresh()
     def _reset_zoom(self):
         if self.orig_np is None: return
-        W = self.orig_np.shape[1]; z = min(1.0, 820.0/max(1,W)); self.zoom_var.set(z); self.zoom = z; self._refresh(); self.preview()
-    def on_zoom(self, *_): self.zoom = float(self.zoom_var.get()); self._refresh(); self.preview()
+        W = self.orig_np.shape[1]; z = min(1.0, 820.0/max(1,W)); self.zoom_var.set(z); self.zoom = z; self._refresh()
+    def on_zoom(self, *_): self.zoom = float(self.zoom_var.get()); self._refresh()
     def on_mousewheel(self, e): delta = 1 if getattr(e,"delta",0)>0 or getattr(e,"num",0)==4 else -1; self._zoom_step(delta*0.1)
     def on_pan_start(self, e): self.canvas.scan_mark(e.x, e.y)
     def on_pan_move(self, e): self.canvas.scan_dragto(e.x, e.y, gain=1)
@@ -154,8 +163,10 @@ class App(tk.Tk):
         self.mask=Mask(H,W); self.zoom = min(1.0, 820.0/max(1,W)); self.zoom_var.set(self.zoom)
         self.range_base=None; self.range_hsv=None; self._update_range_widgets(); self._range_pick_active=False
         self._draw_thumb(self.thumb_orig, self.orig_np)  # "ANTES" fixo
+        self._cancel_preview_job()
         self.preview_np=None  # força render original até a primeira preview
-        self._refresh(); self.preview()
+        self.preview_dirty=True
+        self._refresh(); self.preview(immediate=True)
 
     def load_reference(self):
         p=filedialog.askopenfilename(filetypes=[("Images","*.png;*.jpg;*.jpeg;*.bmp;*.webp")])
@@ -163,7 +174,7 @@ class App(tk.Tk):
         self.ref_np=pil_to_np(pil_open(p)); self._draw_thumb(self.thumb_ref, self.ref_np); self._clear_palette_swatches()
 
     def save_png(self):
-        if self.preview_np is None: self.preview()
+        if self.preview_np is None or self.preview_dirty: self.preview(immediate=True)
         p=filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG","*.png")])
         if not p: return
         np_to_pil(self.preview_np).save(p)
@@ -179,7 +190,12 @@ class App(tk.Tk):
     def _render_left(self, overlay_mask=None):
         if self.orig_np is None: return
         # >>> use PREVIEW image if we have it (live recolor on big canvas)
-        base_np = self.preview_np if (self.preview_np is not None and self.live_preview.get()) else self.orig_np
+        use_preview = (
+            self.preview_np is not None
+            and self.live_preview.get()
+            and not self.preview_dirty
+        )
+        base_np = self.preview_np if use_preview else self.orig_np
         base = Image.fromarray(base_np, mode="RGBA")
 
         # overlay selection (current + temporary)
@@ -258,7 +274,7 @@ class App(tk.Tk):
         if self._rubber_id is not None:
             self.canvas.delete(self._rubber_id); self._rubber_id=None; self._rubber_bbox=None
         self._render_live_preview()  # final
-        self.preview()
+        self.preview(immediate=True)
 
     # live preview composer
     def _build_temp_mask(self):
@@ -270,10 +286,7 @@ class App(tk.Tk):
 
     def _render_live_preview(self, temp_shape=False):
         temp = self._build_temp_mask() if temp_shape else None
-        # First compute preview so left canvas can use recolored result
-        if self.live_preview.get():
-            self.preview(temp_mask=temp)
-        # Then render left with overlay + rubberband
+        self.preview()
         self._render_left(overlay_mask=temp)
 
     # color + palette
@@ -361,39 +374,72 @@ class App(tk.Tk):
         self.r.set(int(target[0])); self.g.set(int(target[1])); self.b.set(int(target[2])); self.a.set(int(target[3])); self.preview()
 
     # preview
-    def preview(self,*_, temp_mask=None):
-        if self.orig_np is None: return
+    def preview(self,*_, immediate=False):
+        if self.orig_np is None:
+            return
+        self._invalidate_preview(immediate=immediate)
+
+    def _cancel_preview_job(self):
+        if self._preview_job is not None:
+            try:
+                self.after_cancel(self._preview_job)
+            finally:
+                self._preview_job=None
+
+    def _invalidate_preview(self, immediate=False):
+        self.preview_dirty=True
+        self._cancel_preview_job()
+        if immediate:
+            self._run_preview()
+        else:
+            self._preview_job = self.after(160, self._run_preview)
+        if self.live_preview.get():
+            self._render_left()
+
+    def _resolve_mask(self):
+        if not self.apply_only.get() or self.mask is None:
+            return None
+        base = self.mask.alpha if self.mask.any_selected() else None
+        if base is None:
+            H,W,_=self.orig_np.shape
+            return np.zeros((H,W), dtype=np.float32)
+        return base
+
+    def _current_threshold(self):
+        if not self.range_enable.get() or self.range_base is None:
+            return None
+        return {
+            "base": self.range_base,
+            "h_tolerance": self.range_h_tol.get(),
+            "s_tolerance": self.range_s_tol.get()/100.0,
+            "v_tolerance": self.range_v_tol.get()/100.0,
+        }
+
+    def _run_preview(self):
+        if self.orig_np is None:
+            self.preview_dirty=False
+            self._preview_job=None
+            return
         tgt=(self.r.get(), self.g.get(), self.b.get(), self.a.get())
-
-        mask_to_use=None
-        if self.apply_only.get() and self.mask is not None:
-            base = self.mask.alpha if self.mask.any_selected() else None
-            if temp_mask is not None:
-                mask_to_use = temp_mask if base is None else np.maximum(base, temp_mask)
-            else:
-                # If apply_only is ON and there is NO selection, pass an empty mask so nothing changes
-                if base is None:
-                    H,W,_=self.orig_np.shape
-                    mask_to_use = np.zeros((H,W), dtype=np.float32)
-                else:
-                    mask_to_use = base
-
-        hue_range=(self.hmin.get(), self.hmax.get()) if self.hr_enable.get() else None
-        color_threshold=None
-        if self.range_enable.get() and self.range_base is not None:
-            color_threshold={
-                "base": self.range_base,
-                "h_tolerance": self.range_h_tol.get(),
-                "s_tolerance": self.range_s_tol.get()/100.0,
-                "v_tolerance": self.range_v_tol.get()/100.0,
-            }
+        mask_to_use=self._resolve_mask()
+        color_threshold=self._current_threshold()
         out=recolor_rgba(self.orig_np, tgt, mask=mask_to_use, keep=self.keep.get(), saturation_scale=self.sat.get(),
-                         alpha_mode=self.alpha_mode.get(), hue_range=hue_range, softness_deg=self.hsoft.get(),
-                         tone_blend=self.tone.get(), shade_gamma=self.gamma.get(), color_threshold=color_threshold)
+                         alpha_mode=self.alpha_mode.get(), tone_blend=self.tone.get(), shade_gamma=self.gamma.get(),
+                         color_threshold=color_threshold)
         self.preview_np=out
+        self.preview_dirty=False
+        self._preview_job=None
         self._draw_thumb(self.thumb_res, out)
-        # Also update left canvas to reflect new preview
-        self._render_left()
+        if self.live_preview.get():
+            self._render_left()
+
+    def _on_live_preview_toggle(self):
+        if not self.live_preview.get():
+            self._render_left()
+        elif self.preview_np is None or self.preview_dirty:
+            self.preview(immediate=True)
+        else:
+            self._render_left()
 
 def main(): App().mainloop()
 if __name__=='__main__': main()
