@@ -1,54 +1,215 @@
 
 from __future__ import annotations
+import json
+import math
+import os
+import queue
+import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, colorchooser, messagebox
 from PIL import Image, ImageTk
 import numpy as np
 from .selection_mask import Mask
-from .colorops import recolor_rgba, rgb_to_hsv
+from .colorops import recolor_rgba, rgb_to_hsv, luminance
 from .palette import extract_palette, transfer_map
 from .io_utils import pil_open, pil_to_np, np_to_pil
+
+try:  # Pillow < 9 compatibility
+    RESAMPLE_BILINEAR = Image.Resampling.BILINEAR
+    RESAMPLE_NEAREST = Image.Resampling.NEAREST
+except AttributeError:  # pragma: no cover - fallback for old Pillow
+    RESAMPLE_BILINEAR = Image.BILINEAR
+    RESAMPLE_NEAREST = Image.NEAREST
+
+
+class PreviewWorker(threading.Thread):
+    def __init__(self, app: 'App'):
+        super().__init__(daemon=True)
+        self.app = app
+        self._queue = queue.Queue()
+        self._queue_lock = threading.Lock()
+        self.start()
+
+    def schedule(self, payload: dict):
+        with self._queue_lock:
+            while not self._queue.empty():
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    break
+        self._queue.put(payload)
+
+    def flush(self):
+        with self._queue_lock:
+            while not self._queue.empty():
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    break
+
+    def stop(self):
+        self.flush()
+        self._queue.put(None)
+
+    def run(self):
+        while True:
+            payload = self._queue.get()
+            if payload is None:
+                break
+            generation = payload.pop('generation')
+            image_id = payload.pop('image_id')
+            quality = payload.get('quality', 'full')
+            try:
+                result = self.app._compute_preview(payload)
+            except Exception as exc:  # pragma: no cover - safeguard
+                # Surface the error to Tk thread for visibility
+                def _raise_error(err=exc):
+                    raise err
+                self.app.after(0, _raise_error)
+                continue
+            self.app.after(0, lambda res=result, gen=generation, iid=image_id, q=quality: self.app._on_preview_ready(gen, iid, res, q))
+
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+        self._prefs_path = os.path.join(os.path.expanduser("~"), ".recolor_rgba_prefs.json")
+        self._prefs = self._load_preferences()
+        self._tracked_vars = []
+        self._preview_job=None
+        self._preview_worker=None
+        self._preview_generation=0
+        self._preview_delay_ms = 90
+        self._full_quality_job=None
+        self._full_preview_delay_ms = 240
+        self._image_serial=0
+        self._color_cache=None
+        self._draft_np=None
+        self._draft_cache=None
+        self._draft_scale=1.0
+        self._draft_pixel_cap=1_200_000
+        self._last_preview_quality="full"
+
+        geometry = self._prefs.get("geometry", "1400x860")
         self.title("Recolor RGBA — Pro v1.0")
-        self.configure(bg="#0B1020"); self.geometry("1400x860")
-        self._tool="Brush"; self._show_mask=True
-        self.brush_shape=tk.StringVar(value="Circle")
-        self.eraser_shape=tk.StringVar(value="Circle")
+        self.configure(bg="#0B1020")
+        try:
+            self.geometry(geometry)
+        except tk.TclError:
+            self.geometry("1400x860")
+        self.minsize(960, 620)
+        self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+
+        self._tool=self._prefs.get("tool","Brush")
+        self._show_mask=bool(self._prefs.get("show_mask", True))
+        self.brush_shape=tk.StringVar(value=self._pref_str("brush_shape","Circle")); self._track_var("brush_shape", self.brush_shape)
+        self.eraser_shape=tk.StringVar(value=self._pref_str("eraser_shape","Circle")); self._track_var("eraser_shape", self.eraser_shape)
         self.orig_np=None; self.ref_np=None; self.mask=None; self.preview_np=None
-        self.preview_dirty=True; self._preview_job=None
-        self.zoom = 1.0
-        self.apply_only=tk.BooleanVar(value=False)
-        self.live_preview=tk.BooleanVar(value=True)
+        self.preview_dirty=True
+        self.zoom = max(0.25, min(6.0, self._pref_float("zoom", 1.0)))
+        self.apply_only=tk.BooleanVar(value=self._pref_bool("apply_only", False)); self._track_var("apply_only", self.apply_only)
+        self.live_preview=tk.BooleanVar(value=self._pref_bool("live_preview", True)); self._track_var("live_preview", self.live_preview)
         self.status=tk.StringVar(value="Load an image. Left: draw/select; Right: controls. Scroll=zoom, Right-drag=pan.")
         self._rubber_id=None; self._rubber_bbox=None
-        self.range_enable=tk.BooleanVar(value=False)
-        self.range_h_tol=tk.IntVar(value=25)
-        self.range_s_tol=tk.IntVar(value=20)
-        self.range_v_tol=tk.IntVar(value=20)
+
+        self.range_enable=tk.BooleanVar(value=self._pref_bool("range_enable", False)); self._track_var("range_enable", self.range_enable)
+        self.range_h_tol=tk.IntVar(value=self._pref_int("range_h_tol", 25)); self._track_var("range_h_tol", self.range_h_tol)
+        self.range_s_tol=tk.IntVar(value=self._pref_int("range_s_tol", 20)); self._track_var("range_s_tol", self.range_s_tol)
+        self.range_v_tol=tk.IntVar(value=self._pref_int("range_v_tol", 20)); self._track_var("range_v_tol", self.range_v_tol)
         self.range_info=tk.StringVar(value="Affect HSV: –")
-        self.range_base=None; self.range_hsv=None
-        self.exclude_enable=tk.BooleanVar(value=False)
-        self.exclude_h_tol=tk.IntVar(value=25)
-        self.exclude_s_tol=tk.IntVar(value=20)
-        self.exclude_v_tol=tk.IntVar(value=20)
+        self.range_base=self._read_color_tuple(self._prefs.get("range_base"))
+        self.range_hsv=self._read_float_tuple(self._prefs.get("range_hsv"))
+
+        self.exclude_enable=tk.BooleanVar(value=self._pref_bool("exclude_enable", False)); self._track_var("exclude_enable", self.exclude_enable)
+        self.exclude_h_tol=tk.IntVar(value=self._pref_int("exclude_h_tol", 25)); self._track_var("exclude_h_tol", self.exclude_h_tol)
+        self.exclude_s_tol=tk.IntVar(value=self._pref_int("exclude_s_tol", 20)); self._track_var("exclude_s_tol", self.exclude_s_tol)
+        self.exclude_v_tol=tk.IntVar(value=self._pref_int("exclude_v_tol", 20)); self._track_var("exclude_v_tol", self.exclude_v_tol)
         self.exclude_info=tk.StringVar(value="Exclude HSV: –")
-        self.exclude_base=None; self.exclude_hsv=None
+        self.exclude_base=self._read_color_tuple(self._prefs.get("exclude_base"))
+        self.exclude_hsv=self._read_float_tuple(self._prefs.get("exclude_hsv"))
+
+        self.r=tk.IntVar(value=self._pref_int("target_r", 249)); self._track_var("target_r", self.r)
+        self.g=tk.IntVar(value=self._pref_int("target_g", 53)); self._track_var("target_g", self.g)
+        self.b=tk.IntVar(value=self._pref_int("target_b", 92)); self._track_var("target_b", self.b)
+        self.a=tk.IntVar(value=self._pref_int("target_a", 253)); self._track_var("target_a", self.a)
+
+        self.keep=tk.StringVar(value=self._pref_str("keep", "value")); self._track_var("keep", self.keep)
+        self.sat=tk.DoubleVar(value=self._pref_float("sat", 1.0)); self._track_var("sat", self.sat)
+        self.alpha_mode=tk.StringVar(value=self._pref_str("alpha_mode", "preserve")); self._track_var("alpha_mode", self.alpha_mode)
+        self.tone=tk.DoubleVar(value=self._pref_float("tone", 0.9)); self._track_var("tone", self.tone)
+        self.gamma=tk.DoubleVar(value=self._pref_float("gamma", 1.0)); self._track_var("gamma", self.gamma)
+
+        self.brush_size=tk.IntVar(value=self._pref_int("brush_size", 36)); self._track_var("brush_size", self.brush_size)
+        self.feather=tk.IntVar(value=self._pref_int("feather", 12)); self._track_var("feather", self.feather)
+        self.tolerance=tk.IntVar(value=self._pref_int("tolerance", 24)); self._track_var("tolerance", self.tolerance)
+        self.zoom_var = tk.DoubleVar(value=self.zoom); self._track_var("zoom", self.zoom_var)
+
         self._active_pick=None
         self._build(); self._bind_shortcuts()
+        self._preview_worker = PreviewWorker(self)
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    @staticmethod
+    def _coerce_tuple(value, caster, length):
+        if isinstance(value, (list, tuple)) and len(value) == length:
+            try:
+                return tuple(caster(v) for v in value)
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _pref_int(self, key, default):
+        try:
+            return int(self._prefs.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _pref_float(self, key, default):
+        try:
+            return float(self._prefs.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _pref_bool(self, key, default):
+        val = self._prefs.get(key, default)
+        if isinstance(val, str):
+            return val.strip().lower() in {"1","true","yes","on"}
+        return bool(val)
+
+    def _pref_str(self, key, default):
+        val = self._prefs.get(key, default)
+        if val is None:
+            return default
+        return str(val)
+
+    def _read_color_tuple(self, value):
+        tup = self._coerce_tuple(value, int, 3)
+        if tup is None:
+            return None
+        return tuple(max(0, min(255, int(v))) for v in tup)
+
+    def _read_float_tuple(self, value):
+        tup = self._coerce_tuple(value, float, 3)
+        if tup is None:
+            return None
+        return tuple(float(v) for v in tup)
+
+    def _track_var(self, key, var):
+        self._tracked_vars.append((key, var))
 
     def _build(self):
         s=ttk.Style(self); s.theme_use("clam")
         s.configure("TFrame", background="#12172A"); s.configure("TLabel", background="#12172A", foreground="#E5E7EB")
         s.configure("TButton", background="#1F243C", foreground="#E5E7EB")
         paned = ttk.Panedwindow(self, orient="horizontal"); paned.pack(fill="both", expand=True, padx=8, pady=8)
-        left = ttk.Frame(paned); right = ttk.Frame(paned); paned.add(left, weight=1); paned.add(right, weight=1)
+        left = ttk.Frame(paned); right_shell = ttk.Frame(paned)
+        paned.add(left, weight=3); paned.add(right_shell, weight=2)
 
         # LEFT
-        cframe = ttk.Frame(left); cframe.pack()
-        self.canvas = tk.Canvas(cframe, width=820, height=520, bg="#0E1224", highlightthickness=0, scrollregion=(0,0,820,520), cursor="tcross")
+        left.columnconfigure(0, weight=1)
+        cframe = ttk.Frame(left); cframe.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(cframe, width=820, height=520, bg="#0E1224", highlightthickness=0, cursor="tcross")
         hbar = tk.Scrollbar(cframe, orient="horizontal"); vbar = tk.Scrollbar(cframe, orient="vertical")
         hbar.config(command=self.canvas.xview); vbar.config(command=self.canvas.yview)
         self.canvas.config(xscrollcommand=hbar.set, yscrollcommand=vbar.set)
@@ -60,10 +221,10 @@ class App(tk.Tk):
             ttk.Button(bar,text=n,command=lambda x=n:self._tool_action(x)).pack(side="left",padx=3)
 
         ctr=ttk.Frame(left); ctr.pack(fill="x",pady=6)
-        self.brush_size=tk.IntVar(value=36); ttk.Label(ctr,text="Size").pack(side="left"); tk.Scale(ctr,from_=2,to=200,variable=self.brush_size,orient="horizontal",length=150,command=lambda e:self._refresh()).pack(side="left",padx=6)
-        self.feather=tk.IntVar(value=12); ttk.Label(ctr,text="Feather").pack(side="left"); tk.Scale(ctr,from_=0,to=100,variable=self.feather,orient="horizontal",length=150,command=lambda e:self._refresh()).pack(side="left",padx=6)
-        self.tolerance=tk.IntVar(value=24); ttk.Label(ctr,text="Tolerance").pack(side="left"); tk.Scale(ctr,from_=0,to=120,variable=self.tolerance,orient="horizontal",length=150).pack(side="left",padx=6)
-        ttk.Label(ctr,text="Zoom ×").pack(side="left"); self.zoom_var = tk.DoubleVar(value=1.0)
+        ttk.Label(ctr,text="Size").pack(side="left"); tk.Scale(ctr,from_=2,to=200,variable=self.brush_size,orient="horizontal",length=150,command=lambda e:self._refresh()).pack(side="left",padx=6)
+        ttk.Label(ctr,text="Feather").pack(side="left"); tk.Scale(ctr,from_=0,to=100,variable=self.feather,orient="horizontal",length=150,command=lambda e:self._refresh()).pack(side="left",padx=6)
+        ttk.Label(ctr,text="Tolerance").pack(side="left"); tk.Scale(ctr,from_=0,to=120,variable=self.tolerance,orient="horizontal",length=150).pack(side="left",padx=6)
+        ttk.Label(ctr,text="Zoom ×").pack(side="left")
         tk.Scale(ctr,from_=0.25,to=6.0,resolution=0.05,variable=self.zoom_var,orient="horizontal",length=220,command=self.on_zoom).pack(side="left",padx=6)
 
         shape_row=ttk.Frame(left); shape_row.pack(fill="x",pady=4)
@@ -81,19 +242,48 @@ class App(tk.Tk):
 
         ttk.Label(self, textvariable=self.status).pack(fill="x", side="bottom")
 
-        # RIGHT
+        # RIGHT (scrollable)
+        right_canvas = tk.Canvas(right_shell, bg="#12172A", highlightthickness=0)
+        right_scroll = ttk.Scrollbar(right_shell, orient="vertical", command=right_canvas.yview)
+        right_canvas.configure(yscrollcommand=right_scroll.set)
+        right_canvas.pack(side="left", fill="both", expand=True)
+        right_scroll.pack(side="right", fill="y")
+        right = ttk.Frame(right_canvas)
+        right_window = right_canvas.create_window((0,0), window=right, anchor="nw")
+
+        def _sync_right(event):
+            right_canvas.configure(scrollregion=right_canvas.bbox("all"))
+            right_canvas.itemconfigure(right_window, width=event.width)
+
+        right.bind("<Configure>", _sync_right)
+        right_canvas.bind("<Configure>", lambda e: right_canvas.itemconfigure(right_window, width=e.width))
+
+        def _scroll_right(event):
+            delta = 0
+            if getattr(event, 'delta', 0):
+                delta = -1 if event.delta > 0 else 1
+            elif getattr(event, 'num', None) in (4, 5):
+                delta = -1 if event.num == 4 else 1
+            if delta:
+                right_canvas.yview_scroll(delta, "units")
+            return "break"
+
+        right_canvas.bind("<MouseWheel>", _scroll_right)
+        right_canvas.bind("<Button-4>", _scroll_right)
+        right_canvas.bind("<Button-5>", _scroll_right)
+        right.bind("<MouseWheel>", _scroll_right)
+
         cf=ttk.Labelframe(right,text="Target Color"); cf.pack(fill="x",pady=6)
-        self.r=tk.IntVar(value=249); self.g=tk.IntVar(value=53); self.b=tk.IntVar(value=92); self.a=tk.IntVar(value=253)
         for (lbl,var) in [("R",self.r),("G",self.g),("B",self.b),("A",self.a)]:
             ttk.Label(cf,text=lbl).pack(side="left"); tk.Scale(cf,from_=0,to=255,variable=var,orient="horizontal",length=160,command=lambda e:self.preview()).pack(side="left",padx=6)
         ttk.Button(cf,text="Pick…",command=self.pick_color).pack(side="left",padx=6)
 
         tf=ttk.Labelframe(right,text="Tone / Hue"); tf.pack(fill="x",pady=6)
-        self.keep=tk.StringVar(value="value"); ttk.Label(tf,text="Preserve").pack(side="left"); ttk.Combobox(tf,values=["value","luminance"],textvariable=self.keep,width=10).pack(side="left",padx=6)
-        self.sat=tk.DoubleVar(value=1.0); ttk.Label(tf,text="Sat ×").pack(side="left"); tk.Scale(tf,from_=0,to=2,resolution=0.01,variable=self.sat,orient="horizontal",length=180,command=lambda e:self.preview()).pack(side="left",padx=6)
-        self.alpha_mode=tk.StringVar(value="preserve"); ttk.Label(tf,text="Alpha").pack(side="left"); ttk.Combobox(tf,values=["preserve","multiply"],textvariable=self.alpha_mode,width=10).pack(side="left",padx=6)
-        self.tone=tk.DoubleVar(value=0.9); ttk.Label(tf,text="Tone blend").pack(side="left"); tk.Scale(tf,from_=0,to=1,resolution=0.01,variable=self.tone,orient="horizontal",length=180,command=lambda e:self.preview()).pack(side="left",padx=6)
-        self.gamma=tk.DoubleVar(value=1.0); ttk.Label(tf,text="Shading γ").pack(side="left"); tk.Scale(tf,from_=0.4,to=2,resolution=0.01,variable=self.gamma,orient="horizontal",length=180,command=lambda e:self.preview()).pack(side="left",padx=6)
+        ttk.Label(tf,text="Preserve").pack(side="left"); ttk.Combobox(tf,values=["value","luminance"],textvariable=self.keep,width=10).pack(side="left",padx=6)
+        ttk.Label(tf,text="Sat ×").pack(side="left"); tk.Scale(tf,from_=0,to=2,resolution=0.01,variable=self.sat,orient="horizontal",length=180,command=lambda e:self.preview()).pack(side="left",padx=6)
+        ttk.Label(tf,text="Alpha").pack(side="left"); ttk.Combobox(tf,values=["preserve","multiply"],textvariable=self.alpha_mode,width=10).pack(side="left",padx=6)
+        ttk.Label(tf,text="Tone blend").pack(side="left"); tk.Scale(tf,from_=0,to=1,resolution=0.01,variable=self.tone,orient="horizontal",length=180,command=lambda e:self.preview()).pack(side="left",padx=6)
+        ttk.Label(tf,text="Shading γ").pack(side="left"); tk.Scale(tf,from_=0.4,to=2,resolution=0.01,variable=self.gamma,orient="horizontal",length=180,command=lambda e:self.preview()).pack(side="left",padx=6)
 
         rf=ttk.Labelframe(right,text="Color Ranges"); rf.pack(fill="x",pady=6)
         self._build_threshold_section(rf, kind="include", title="Affect range")
@@ -168,7 +358,13 @@ class App(tk.Tk):
         z = max(0.25, min(6.0, self.zoom + dz)); self.zoom_var.set(z); self.zoom = z; self._refresh()
     def _reset_zoom(self):
         if self.orig_np is None: return
-        W = self.orig_np.shape[1]; z = min(1.0, 820.0/max(1,W)); self.zoom_var.set(z); self.zoom = z; self._refresh()
+        H, W = self.orig_np.shape[0], self.orig_np.shape[1]
+        self.update_idletasks()
+        canvas_w = max(1, self.canvas.winfo_width()) if hasattr(self, 'canvas') else 820
+        canvas_h = max(1, self.canvas.winfo_height()) if hasattr(self, 'canvas') else 520
+        z = min(canvas_w/float(max(1,W)), canvas_h/float(max(1,H)), 1.0)
+        z = max(0.25, z)
+        self.zoom_var.set(z); self.zoom = z; self._refresh()
     def _update_canvas_cursor(self):
         if not hasattr(self, "canvas"):
             return
@@ -190,9 +386,24 @@ class App(tk.Tk):
         p=filedialog.askopenfilename(filetypes=[("Images","*.png;*.jpg;*.jpeg;*.bmp;*.webp")])
         if not p: return
         im=pil_open(p); npimg=pil_to_np(im); self.orig_np=npimg; H,W,_=npimg.shape
-        self.mask=Mask(H,W); self.zoom = min(1.0, 820.0/max(1,W)); self.zoom_var.set(self.zoom)
-        self.range_base=None; self.range_hsv=None
-        self.exclude_base=None; self.exclude_hsv=None
+        self.mask=Mask(H,W)
+        self._color_cache = self._build_color_cache(npimg)
+        self._setup_preview_buffers(npimg)
+        self._last_preview_quality = "full"
+        self._image_serial += 1
+        if self._preview_worker is not None:
+            self._preview_worker.flush()
+        if self._full_quality_job is not None:
+            try:
+                self.after_cancel(self._full_quality_job)
+            finally:
+                self._full_quality_job=None
+        self.update_idletasks()
+        canvas_w = max(1, self.canvas.winfo_width()) if hasattr(self, 'canvas') else 820
+        canvas_h = max(1, self.canvas.winfo_height()) if hasattr(self, 'canvas') else 520
+        fit_zoom = min(canvas_w/float(max(1,W)), canvas_h/float(max(1,H)), 1.0)
+        self.zoom = max(0.25, fit_zoom)
+        self.zoom_var.set(self.zoom)
         self._update_threshold_widgets("include")
         self._update_threshold_widgets("exclude")
         self._active_pick=None; self._update_canvas_cursor()
@@ -200,7 +411,8 @@ class App(tk.Tk):
         self._cancel_preview_job()
         self.preview_np=None  # força render original até a primeira preview
         self.preview_dirty=True
-        self._refresh(); self.preview(immediate=True)
+        self._render_left()
+        self.preview(immediate=True)
 
     def load_reference(self):
         p=filedialog.askopenfilename(filetypes=[("Images","*.png;*.jpg;*.jpeg;*.bmp;*.webp")])
@@ -214,11 +426,87 @@ class App(tk.Tk):
         np_to_pil(self.preview_np).save(p)
 
     # thumbnails / render
+    def _build_color_cache(self, npimg):
+        if npimg is None:
+            return None
+        src = npimg.astype(np.float32) / 255.0
+        r = src[...,0]
+        g = src[...,1]
+        b = src[...,2]
+        a = src[...,3]
+        h,s,v = rgb_to_hsv(r,g,b)
+        Yo = luminance(r,g,b)
+        return {
+            'src': src,
+            'r': r,
+            'g': g,
+            'b': b,
+            'a': a,
+            'h': h,
+            's': s,
+            'v': v,
+            'Yo': Yo,
+        }
+
+    def _setup_preview_buffers(self, npimg):
+        self._draft_np=None
+        self._draft_cache=None
+        self._draft_scale=1.0
+        if npimg is None:
+            return
+        H,W,_ = npimg.shape
+        total = H * W
+        if total <= self._draft_pixel_cap:
+            return
+        scale = math.sqrt(self._draft_pixel_cap / float(total))
+        scale = max(0.18, min(scale, 1.0))
+        new_w = max(1, int(W * scale))
+        new_h = max(1, int(H * scale))
+        if new_w == W and new_h == H:
+            return
+        down = Image.fromarray(npimg, mode="RGBA").resize((new_w, new_h), RESAMPLE_BILINEAR)
+        self._draft_np = np.array(down, dtype=np.uint8)
+        self._draft_cache = self._build_color_cache(self._draft_np)
+        self._draft_scale = scale
+
+    def _resample_mask_to(self, mask, target_shape):
+        if mask is None:
+            return None
+        target_h, target_w = target_shape
+        if mask.shape == (target_h, target_w):
+            return mask
+        pil_mask = Image.fromarray((np.clip(mask, 0, 1) * 255.0 + 0.5).astype(np.uint8), mode="L")
+        resized = pil_mask.resize((target_w, target_h), RESAMPLE_BILINEAR)
+        arr = np.asarray(resized, dtype=np.float32) / 255.0
+        return arr
+
+    def _upsample_preview(self, npimg):
+        if npimg is None or self.orig_np is None:
+            return npimg
+        H,W,_ = self.orig_np.shape
+        if npimg.shape[0] == H and npimg.shape[1] == W:
+            return npimg
+        up = Image.fromarray(npimg, mode="RGBA").resize((W, H), RESAMPLE_BILINEAR)
+        return np.array(up, dtype=np.uint8)
+
+    def _queue_full_quality(self, generation):
+        if self._draft_np is None:
+            return
+        if self._full_quality_job is not None:
+            try:
+                self.after_cancel(self._full_quality_job)
+            except tk.TclError:
+                pass
+        self._full_quality_job = self.after(
+            self._full_preview_delay_ms,
+            lambda g=generation: self._run_preview(generation=g, quality="full"),
+        )
+
     def _draw_thumb(self, canvas, npimg):
         if npimg is None: return
         canvas.delete("all")
         im = Image.fromarray(npimg, mode="RGBA"); W,H = im.size; w,h = int(canvas['width']), int(canvas['height'])
-        scale = min(w/W, h/H, 1.0); disp = im.resize((int(W*scale), int(H*scale)), Image.NEAREST)
+        scale = min(w/W, h/H, 1.0); disp = im.resize((int(W*scale), int(H*scale)), RESAMPLE_NEAREST)
         tkimg = ImageTk.PhotoImage(disp); canvas.image = tkimg; canvas.create_image(0,0,image=tkimg,anchor="nw")
 
     def _render_left(self, overlay_mask=None):
@@ -436,14 +724,24 @@ class App(tk.Tk):
                 self.after_cancel(self._preview_job)
             finally:
                 self._preview_job=None
+        if self._full_quality_job is not None:
+            try:
+                self.after_cancel(self._full_quality_job)
+            finally:
+                self._full_quality_job=None
 
     def _invalidate_preview(self, immediate=False):
         self.preview_dirty=True
+        self._preview_generation += 1
+        generation = self._preview_generation
         self._cancel_preview_job()
         if immediate:
-            self._run_preview()
+            self._run_preview(generation=generation, blocking=True, quality="full")
         else:
-            self._preview_job = self.after(120, self._run_preview)
+            self._preview_job = self.after(
+                self._preview_delay_ms,
+                lambda g=generation: self._run_preview(generation=g, quality="draft"),
+            )
 
     def _resolve_mask(self):
         if not self.apply_only.get() or self.mask is None:
@@ -471,24 +769,54 @@ class App(tk.Tk):
             "v_tolerance": v_var.get()/100.0,
         }
 
-    def _run_preview(self):
-        if self.orig_np is None:
-            self.preview_dirty=False
-            self._preview_job=None
+    def _run_preview(self, generation, blocking=False, quality="auto"):
+        self._preview_job=None
+        if quality == "full":
+            requested_quality = "full"
+        elif quality == "draft" and not blocking and self._draft_np is not None and self._draft_cache is not None:
+            requested_quality = "draft"
+        else:
+            requested_quality = "full"
+        if requested_quality == "full":
+            image_np = self.orig_np
+            cache = self._color_cache
+            mask_shape = None
+            self._full_quality_job = None
+        else:
+            image_np = self._draft_np
+            cache = self._draft_cache
+            mask_shape = image_np.shape[:2]
+            if not blocking:
+                self._queue_full_quality(generation)
+        if self.orig_np is None or generation != self._preview_generation:
             return
         tgt=(self.r.get(), self.g.get(), self.b.get(), self.a.get())
         mask_to_use=self._resolve_mask()
+        mask_copy = None if mask_to_use is None else mask_to_use.astype(np.float32, copy=True)
+        if mask_shape is not None and mask_copy is not None:
+            mask_copy = self._resample_mask_to(mask_copy, mask_shape)
         color_threshold=self._current_threshold("include")
         exclude_threshold=self._current_threshold("exclude")
-        out=recolor_rgba(self.orig_np, tgt, mask=mask_to_use, keep=self.keep.get(), saturation_scale=self.sat.get(),
-                         alpha_mode=self.alpha_mode.get(), tone_blend=self.tone.get(), shade_gamma=self.gamma.get(),
-                         color_threshold=color_threshold, exclude_threshold=exclude_threshold)
-        self.preview_np=out
-        self.preview_dirty=False
-        self._preview_job=None
-        self._draw_thumb(self.thumb_res, out)
-        if self.live_preview.get():
-            self._render_left()
+        payload = {
+            'image': image_np,
+            'target_rgba': tgt,
+            'mask': mask_copy,
+            'keep': self.keep.get(),
+            'sat': self.sat.get(),
+            'alpha_mode': self.alpha_mode.get(),
+            'tone': self.tone.get(),
+            'gamma': self.gamma.get(),
+            'color_threshold': color_threshold,
+            'exclude_threshold': exclude_threshold,
+            'cache': cache,
+            'quality': requested_quality,
+        }
+        if blocking or self._preview_worker is None:
+            result = self._compute_preview(payload)
+            self._on_preview_ready(generation, self._image_serial, result, requested_quality)
+        else:
+            payload.update({'generation': generation, 'image_id': self._image_serial})
+            self._preview_worker.schedule(payload)
 
     def _on_live_preview_toggle(self):
         if not self.live_preview.get():
@@ -497,6 +825,73 @@ class App(tk.Tk):
             self.preview(immediate=True)
         else:
             self._render_left()
+
+    def _compute_preview(self, payload):
+        return recolor_rgba(
+            payload['image'],
+            payload['target_rgba'],
+            mask=payload['mask'],
+            keep=payload['keep'],
+            saturation_scale=payload['sat'],
+            alpha_mode=payload['alpha_mode'],
+            tone_blend=payload['tone'],
+            shade_gamma=payload['gamma'],
+            color_threshold=payload['color_threshold'],
+            exclude_threshold=payload['exclude_threshold'],
+            cache=payload.get('cache'),
+        )
+
+    def _on_preview_ready(self, generation, image_id, out, quality="full"):
+        if image_id != self._image_serial or generation != self._preview_generation:
+            return
+        if quality == "draft":
+            out = self._upsample_preview(out)
+        self.preview_np=out
+        self._last_preview_quality = quality
+        self.preview_dirty = (quality != "full")
+        self._draw_thumb(self.thumb_res, out)
+        if self.live_preview.get():
+            self._render_left()
+
+    def _load_preferences(self):
+        try:
+            with open(self._prefs_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+                if isinstance(data, dict):
+                    return data
+        except (OSError, json.JSONDecodeError):
+            pass
+        return {}
+
+    def _save_preferences(self):
+        data = {}
+        for key, var in self._tracked_vars:
+            try:
+                value = var.get()
+            except tk.TclError:
+                continue
+            if hasattr(value, "item"):
+                value = value.item()
+            data[key] = value
+        data["tool"] = self._tool
+        data["show_mask"] = bool(self._show_mask)
+        data["geometry"] = self.geometry()
+        data["range_base"] = list(self.range_base) if self.range_base is not None else None
+        data["range_hsv"] = list(self.range_hsv) if self.range_hsv is not None else None
+        data["exclude_base"] = list(self.exclude_base) if self.exclude_base is not None else None
+        data["exclude_hsv"] = list(self.exclude_hsv) if self.exclude_hsv is not None else None
+        try:
+            with open(self._prefs_path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+        except OSError:
+            pass
+        self._prefs = data
+
+    def on_close(self):
+        self._save_preferences()
+        if self._preview_worker is not None:
+            self._preview_worker.stop()
+        self.destroy()
 
 def main(): App().mainloop()
 if __name__=='__main__': main()

@@ -37,16 +37,44 @@ def srgb_to_linear(c): return np.where(c<=0.04045,c/12.92,((c+0.055)/1.055)**2.4
 def luminance(r,g,b): R=srgb_to_linear(r); G=srgb_to_linear(g); B=srgb_to_linear(b); return 0.2126*R+0.7152*G+0.0722*B
 def recolor_rgba(img_rgba, target_rgba, mask=None, keep='value', saturation_scale=1.0,
                  alpha_mode='preserve', tone_blend=0.9, shade_gamma=1.0,
-                 color_threshold=None, exclude_threshold=None):
+                 color_threshold=None, exclude_threshold=None, cache=None):
     # Inputs
-    src=img_rgba.astype(np.float32)/255.0
-    r,g,b,a=src[...,0],src[...,1],src[...,2],src[...,3]
+    if cache is not None:
+        src = cache.get('src')
+        r = cache.get('r')
+        g = cache.get('g')
+        b = cache.get('b')
+        a = cache.get('a')
+        h = cache.get('h')
+        s = cache.get('s')
+        v = cache.get('v')
+        Yo = cache.get('Yo')
+        if any(x is None for x in (src, r, g, b, a, h, s, v, Yo)):
+            cache = None  # fallback to recompute if cache incomplete
+    if cache is None:
+        src=img_rgba.astype(np.float32)/255.0
+        r,g,b,a=src[...,0],src[...,1],src[...,2],src[...,3]
+        h,s,v=rgb_to_hsv(r,g,b)
+        Yo=luminance(r,g,b)
+    else:
+        # ensure we operate on readonly cached arrays
+        src = np.asarray(src)
+        r = np.asarray(r)
+        g = np.asarray(g)
+        b = np.asarray(b)
+        a = np.asarray(a)
+        h = np.asarray(h)
+        s = np.asarray(s)
+        v = np.asarray(v)
+        Yo = np.asarray(Yo)
+    Yo_orig = Yo
     tr,tg,tb,ta=[x/255.0 for x in target_rgba]
     th,ts,_=rgb_to_hsv(np.array([tr]),np.array([tg]),np.array([tb])); th=th[0]; ts=float(np.clip(ts[0]*saturation_scale,0,1))
     # Build weight map
     H,W=r.shape
     wgt = np.ones((H,W), dtype=np.float32) if mask is None else mask.astype(np.float32)
-    h,s,v=rgb_to_hsv(r,g,b)
+    if cache is None:
+        h,s,v=rgb_to_hsv(r,g,b)
     if color_threshold is not None and color_threshold.get('base') is not None:
         tol_h = color_threshold.get('h_tolerance', 0.0)
         tol_s = color_threshold.get('s_tolerance', 0.0)
@@ -73,7 +101,7 @@ def recolor_rgba(img_rgba, target_rgba, mask=None, keep='value', saturation_scal
     dh=((th-h+0.5)%1.0)-0.5; newH=(h+wgt*dh)%1.0; newS=np.clip((1-wgt)*s+wgt*ts,0,1); newV=v
     R,G,B=hsv_to_rgb(newH,newS,newV)
     # Lightness/shading preservation
-    Yo=luminance(r,g,b)
+    Yo = Yo_orig
     Yp=luminance(R,G,B)
     if keep == 'value':
         Ydes = Yo
