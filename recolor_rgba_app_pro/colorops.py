@@ -72,10 +72,20 @@ def recolor_rgba(img_rgba, target_rgba, mask=None, keep='value', saturation_scal
     th,ts,_=rgb_to_hsv(np.array([tr]),np.array([tg]),np.array([tb])); th=th[0]; ts=float(np.clip(ts[0]*saturation_scale,0,1))
     # Build weight map
     H,W=r.shape
-    wgt = np.ones((H,W), dtype=np.float32) if mask is None else mask.astype(np.float32)
+    if mask is None:
+        wgt = np.ones((H,W), dtype=np.float32)
+        wgt_is_copy = True
+    else:
+        wgt = np.asarray(mask, dtype=np.float32)
+        if wgt.shape != (H, W):
+            raise ValueError("mask shape must match image dimensions")
+        wgt_is_copy = False
     if cache is None:
         h,s,v=rgb_to_hsv(r,g,b)
     if color_threshold is not None and color_threshold.get('base') is not None:
+        if not wgt_is_copy:
+            wgt = wgt.copy()
+            wgt_is_copy = True
         tol_h = color_threshold.get('h_tolerance', 0.0)
         tol_s = color_threshold.get('s_tolerance', 0.0)
         tol_v = color_threshold.get('v_tolerance', 0.0)
@@ -85,6 +95,9 @@ def recolor_rgba(img_rgba, target_rgba, mask=None, keep='value', saturation_scal
         )
         wgt *= ct_mask
     if exclude_threshold is not None and exclude_threshold.get('base') is not None:
+        if not wgt_is_copy:
+            wgt = wgt.copy()
+            wgt_is_copy = True
         tol_h = exclude_threshold.get('h_tolerance', 0.0)
         tol_s = exclude_threshold.get('s_tolerance', 0.0)
         tol_v = exclude_threshold.get('v_tolerance', 0.0)
