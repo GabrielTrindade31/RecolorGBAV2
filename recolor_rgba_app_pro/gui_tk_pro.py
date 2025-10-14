@@ -79,9 +79,9 @@ class App(tk.Tk):
         self._preview_job=None
         self._preview_worker=None
         self._preview_generation=0
-        self._preview_delay_ms = 90
+        self._preview_delay_ms = 0
         self._full_quality_job=None
-        self._full_preview_delay_ms = 240
+        self._full_preview_delay_ms = 120
         self._image_serial=0
         self._color_cache=None
         self._draft_np=None
@@ -737,6 +737,9 @@ class App(tk.Tk):
         self._cancel_preview_job()
         if immediate:
             self._run_preview(generation=generation, blocking=True, quality="full")
+            return
+        if self._preview_delay_ms <= 0:
+            self._run_preview(generation=generation, quality="draft")
         else:
             self._preview_job = self.after(
                 self._preview_delay_ms,
