@@ -2,12 +2,15 @@ from __future__ import annotations
 import numpy as np
 
 
-def color_threshold_mask(h, s, v, base_rgb, tol_h_deg, tol_s, tol_v):
-    base = np.array(base_rgb, dtype=np.float32) / 255.0
-    bh, bs, bv = rgb_to_hsv(np.array([base[0]]), np.array([base[1]]), np.array([base[2]]))
-    bh = bh[0]
-    bs = float(bs[0])
-    bv = float(bv[0])
+def color_threshold_mask(h, s, v, base_rgb, tol_h_deg, tol_s, tol_v, base_hsv=None):
+    if base_hsv is None:
+        base = np.array(base_rgb, dtype=np.float32) / 255.0
+        bh, bs, bv = rgb_to_hsv(np.array([base[0]]), np.array([base[1]]), np.array([base[2]]))
+        bh = bh[0]
+        bs = float(bs[0])
+        bv = float(bv[0])
+    else:
+        bh, bs, bv = base_hsv
     tol_h = float(tol_h_deg) / 360.0
     tol_s = float(tol_s)
     tol_v = float(tol_v)
@@ -34,7 +37,7 @@ def srgb_to_linear(c): return np.where(c<=0.04045,c/12.92,((c+0.055)/1.055)**2.4
 def luminance(r,g,b): R=srgb_to_linear(r); G=srgb_to_linear(g); B=srgb_to_linear(b); return 0.2126*R+0.7152*G+0.0722*B
 def recolor_rgba(img_rgba, target_rgba, mask=None, keep='value', saturation_scale=1.0,
                  alpha_mode='preserve', tone_blend=0.9, shade_gamma=1.0,
-                 color_threshold=None):
+                 color_threshold=None, exclude_threshold=None):
     # Inputs
     src=img_rgba.astype(np.float32)/255.0
     r,g,b,a=src[...,0],src[...,1],src[...,2],src[...,3]
@@ -48,8 +51,20 @@ def recolor_rgba(img_rgba, target_rgba, mask=None, keep='value', saturation_scal
         tol_h = color_threshold.get('h_tolerance', 0.0)
         tol_s = color_threshold.get('s_tolerance', 0.0)
         tol_v = color_threshold.get('v_tolerance', 0.0)
-        ct_mask = color_threshold_mask(h, s, v, color_threshold['base'], tol_h, tol_s, tol_v)
+        ct_mask = color_threshold_mask(
+            h, s, v, color_threshold['base'], tol_h, tol_s, tol_v,
+            base_hsv=color_threshold.get('base_hsv')
+        )
         wgt *= ct_mask
+    if exclude_threshold is not None and exclude_threshold.get('base') is not None:
+        tol_h = exclude_threshold.get('h_tolerance', 0.0)
+        tol_s = exclude_threshold.get('s_tolerance', 0.0)
+        tol_v = exclude_threshold.get('v_tolerance', 0.0)
+        ex_mask = color_threshold_mask(
+            h, s, v, exclude_threshold['base'], tol_h, tol_s, tol_v,
+            base_hsv=exclude_threshold.get('base_hsv')
+        )
+        wgt *= np.clip(1.0 - ex_mask, 0.0, 1.0)
     # If nothing is targeted, return original to avoid 'white-out'
     if wgt.sum() < 1e-6:
         out = src.copy()
