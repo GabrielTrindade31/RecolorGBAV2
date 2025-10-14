@@ -90,8 +90,9 @@ class App(tk.Tk):
         self._draft_cache=None
         self._draft_scale=1.0
         self._draft_pixel_cap=1_200_000
-        self._work_pixel_cap=900_000
-        self._min_work_scale=0.3
+        self._work_pixel_cap=600_000
+        self._min_work_scale=0.05
+        self._work_max_long_edge=520
         self._working_scale=1.0
         self._working_downscaled=False
         self._last_preview_quality="full"
@@ -425,7 +426,9 @@ class App(tk.Tk):
         self.preview_dirty=True
         if self._working_downscaled:
             pct=int(self._working_scale*100+0.5)
-            self.status.set(f"Trabalhando em pré-visualização a {pct}% para manter a resposta rápida. A exportação usa a resolução total.")
+            self.status.set(
+                f"Trabalhando em pré-visualização a {pct}% (máx. {self._work_max_long_edge}px na borda longa) para manter a resposta rápida. A exportação usa a resolução total."
+            )
         else:
             self.status.set("Imagem carregada. Ajuste os controles à direita e use o mouse para editar.")
         self._render_left()
@@ -502,11 +505,14 @@ class App(tk.Tk):
         H,W,_ = npimg.shape
         total = H * W
         cap = max(1, int(self._work_pixel_cap))
-        if total <= cap:
+        if total <= cap and max(H, W) <= self._work_max_long_edge:
             self._working_scale = 1.0
             self._working_downscaled = False
             return npimg
         scale = math.sqrt(cap / float(total))
+        long_edge = float(max(H, W))
+        if long_edge > self._work_max_long_edge:
+            scale = min(scale, self._work_max_long_edge / long_edge)
         scale = max(self._min_work_scale, min(scale, 1.0))
         new_w = max(1, int(round(W * scale)))
         new_h = max(1, int(round(H * scale)))
