@@ -10,7 +10,12 @@ from tkinter import ttk, filedialog, colorchooser, messagebox
 from PIL import Image, ImageTk
 import numpy as np
 from .selection_mask import Mask
-from .colorops import recolor_rgba, rgb_to_hsv, luminance
+from .colorops import (
+    rgb_to_hsv,
+    luminance,
+    recolor_precompute,
+    apply_precomputed,
+)
 from .palette import extract_palette, transfer_map
 from .io_utils import pil_open, pil_to_np, np_to_pil
 
@@ -79,9 +84,9 @@ class App(tk.Tk):
         self._preview_job=None
         self._preview_worker=None
         self._preview_generation=0
-        self._preview_delay_ms = 90
+        self._preview_delay_ms = 0
         self._full_quality_job=None
-        self._full_preview_delay_ms = 240
+        self._full_preview_delay_ms = 0
         self._image_serial=0
         self._color_cache=None
         self._draft_np=None
@@ -89,6 +94,13 @@ class App(tk.Tk):
         self._draft_scale=1.0
         self._draft_pixel_cap=1_200_000
         self._last_preview_quality="full"
+        self._mask_edit_serial = 0
+        self._mask_cache_full = None
+        self._mask_cache_serial = -1
+        self._mask_resampled = {}
+        self._mask_last_has_selection = False
+        self._tint_full_cache = None
+        self._tint_draft_cache = None
 
         geometry = self._prefs.get("geometry", "1400x860")
         self.title("Recolor RGBA — Pro v1.0")
@@ -275,15 +287,21 @@ class App(tk.Tk):
 
         cf=ttk.Labelframe(right,text="Target Color"); cf.pack(fill="x",pady=6)
         for (lbl,var) in [("R",self.r),("G",self.g),("B",self.b),("A",self.a)]:
-            ttk.Label(cf,text=lbl).pack(side="left"); tk.Scale(cf,from_=0,to=255,variable=var,orient="horizontal",length=160,command=lambda e:self.preview()).pack(side="left",padx=6)
+            ttk.Label(cf,text=lbl).pack(side="left"); tk.Scale(cf,from_=0,to=255,variable=var,orient="horizontal",length=160,command=lambda _evt: self._on_recolor_param_change()).pack(side="left",padx=6)
         ttk.Button(cf,text="Pick…",command=self.pick_color).pack(side="left",padx=6)
 
         tf=ttk.Labelframe(right,text="Tone / Hue"); tf.pack(fill="x",pady=6)
-        ttk.Label(tf,text="Preserve").pack(side="left"); ttk.Combobox(tf,values=["value","luminance"],textvariable=self.keep,width=10).pack(side="left",padx=6)
-        ttk.Label(tf,text="Sat ×").pack(side="left"); tk.Scale(tf,from_=0,to=2,resolution=0.01,variable=self.sat,orient="horizontal",length=180,command=lambda e:self.preview()).pack(side="left",padx=6)
-        ttk.Label(tf,text="Alpha").pack(side="left"); ttk.Combobox(tf,values=["preserve","multiply"],textvariable=self.alpha_mode,width=10).pack(side="left",padx=6)
-        ttk.Label(tf,text="Tone blend").pack(side="left"); tk.Scale(tf,from_=0,to=1,resolution=0.01,variable=self.tone,orient="horizontal",length=180,command=lambda e:self.preview()).pack(side="left",padx=6)
-        ttk.Label(tf,text="Shading γ").pack(side="left"); tk.Scale(tf,from_=0.4,to=2,resolution=0.01,variable=self.gamma,orient="horizontal",length=180,command=lambda e:self.preview()).pack(side="left",padx=6)
+        ttk.Label(tf,text="Preserve").pack(side="left");
+        keep_combo = ttk.Combobox(tf,values=["value","luminance"],textvariable=self.keep,width=10)
+        keep_combo.pack(side="left",padx=6)
+        keep_combo.bind("<<ComboboxSelected>>", self._on_recolor_param_change_event)
+        ttk.Label(tf,text="Sat ×").pack(side="left"); tk.Scale(tf,from_=0,to=2,resolution=0.01,variable=self.sat,orient="horizontal",length=180,command=lambda _evt: self._on_recolor_param_change()).pack(side="left",padx=6)
+        ttk.Label(tf,text="Alpha").pack(side="left");
+        alpha_combo = ttk.Combobox(tf,values=["preserve","multiply"],textvariable=self.alpha_mode,width=10)
+        alpha_combo.pack(side="left",padx=6)
+        alpha_combo.bind("<<ComboboxSelected>>", self._on_recolor_param_change_event)
+        ttk.Label(tf,text="Tone blend").pack(side="left"); tk.Scale(tf,from_=0,to=1,resolution=0.01,variable=self.tone,orient="horizontal",length=180,command=lambda _evt: self._on_recolor_param_change()).pack(side="left",padx=6)
+        ttk.Label(tf,text="Shading γ").pack(side="left"); tk.Scale(tf,from_=0.4,to=2,resolution=0.01,variable=self.gamma,orient="horizontal",length=180,command=lambda _evt: self._on_recolor_param_change()).pack(side="left",padx=6)
 
         rf=ttk.Labelframe(right,text="Color Ranges"); rf.pack(fill="x",pady=6)
         self._build_threshold_section(rf, kind="include", title="Affect range")
@@ -327,7 +345,7 @@ class App(tk.Tk):
         info_var = self.range_info if kind=="include" else self.exclude_info
 
         header = ttk.Frame(frame); header.pack(fill="x", pady=2)
-        ttk.Checkbutton(header, text=title, variable=enable, command=self.preview).pack(side="left", padx=(6,4))
+        ttk.Checkbutton(header, text=title, variable=enable, command=lambda k=kind: self._on_threshold_toggle(k)).pack(side="left", padx=(6,4))
         swatch = tk.Canvas(header, width=34, height=34, highlightthickness=1, highlightbackground="#ffffff", bg="#0E1224")
         swatch.pack(side="left", padx=4)
         if kind=="include":
@@ -387,8 +405,10 @@ class App(tk.Tk):
         if not p: return
         im=pil_open(p); npimg=pil_to_np(im); self.orig_np=npimg; H,W,_=npimg.shape
         self.mask=Mask(H,W)
+        self._mark_mask_dirty()
         self._color_cache = self._build_color_cache(npimg)
         self._setup_preview_buffers(npimg)
+        self._invalidate_tint_cache()
         self._last_preview_quality = "full"
         self._image_serial += 1
         if self._preview_worker is not None:
@@ -420,7 +440,7 @@ class App(tk.Tk):
         self.ref_np=pil_to_np(pil_open(p)); self._draw_thumb(self.thumb_ref, self.ref_np); self._clear_palette_swatches()
 
     def save_png(self):
-        if self.preview_np is None or self.preview_dirty: self.preview(immediate=True)
+        if self.preview_np is None or self.preview_dirty: self.preview(immediate=True, force_full=True)
         p=filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG","*.png")])
         if not p: return
         np_to_pil(self.preview_np).save(p)
@@ -452,6 +472,7 @@ class App(tk.Tk):
         self._draft_np=None
         self._draft_cache=None
         self._draft_scale=1.0
+        self._tint_draft_cache = None
         if npimg is None:
             return
         H,W,_ = npimg.shape
@@ -468,6 +489,132 @@ class App(tk.Tk):
         self._draft_np = np.array(down, dtype=np.uint8)
         self._draft_cache = self._build_color_cache(self._draft_np)
         self._draft_scale = scale
+
+    def _mark_mask_dirty(self):
+        self._mask_edit_serial += 1
+        self._mask_cache_full = None
+        self._mask_cache_serial = -1
+        self._mask_resampled.clear()
+        self._mask_last_has_selection = False
+
+    def _mask_empty_for_shape(self, shape):
+        shape_key = tuple(int(v) for v in shape)
+        key = ("empty", shape_key)
+        cached = self._mask_resampled.get(key)
+        if cached is not None and cached[0] == self._mask_edit_serial:
+            return cached[1]
+        arr = np.zeros(shape_key, dtype=np.float32)
+        self._mask_resampled[key] = (self._mask_edit_serial, arr)
+        return arr
+
+    def _mask_full_array(self):
+        if self.mask is None or self.orig_np is None:
+            return None
+        has_selection = self.mask.any_selected()
+        self._mask_last_has_selection = has_selection
+        base_shape = self.mask.alpha.shape
+        if not has_selection:
+            empty = self._mask_empty_for_shape(base_shape)
+            self._mask_cache_full = empty
+            self._mask_cache_serial = self._mask_edit_serial
+            return empty
+        if self._mask_cache_full is None or self._mask_cache_serial != self._mask_edit_serial:
+            self._mask_cache_full = self.mask.alpha.astype(np.float32, copy=True)
+            self._mask_cache_serial = self._mask_edit_serial
+        return self._mask_cache_full
+
+    def _mask_for_shape(self, target_shape=None):
+        if self.mask is None or self.orig_np is None or not self.apply_only.get():
+            return None
+        base = self._mask_full_array()
+        if base is None:
+            return None
+        if target_shape is None:
+            return base
+        target_key = tuple(int(v) for v in target_shape)
+        if base.shape == target_key:
+            return base
+        key = ("resampled", target_key)
+        cached = self._mask_resampled.get(key)
+        if cached is not None and cached[0] == self._mask_cache_serial:
+            return cached[1]
+        if not self._mask_last_has_selection:
+            resampled = self._mask_empty_for_shape(target_key)
+        else:
+            resampled = self._resample_mask_to(base, target_key)
+        self._mask_resampled[key] = (self._mask_cache_serial, resampled)
+        return resampled
+
+    def _invalidate_tint_cache(self):
+        self._tint_full_cache = None
+        self._tint_draft_cache = None
+
+    def _current_recolor_signature(self):
+        def _round(val):
+            return round(float(val), 6)
+
+        include_base = tuple(int(v) for v in self.range_base) if self.range_base is not None else None
+        include_hsv = (
+            tuple(_round(v) for v in self.range_hsv) if self.range_hsv is not None else None
+        )
+        exclude_base = tuple(int(v) for v in self.exclude_base) if self.exclude_base is not None else None
+        exclude_hsv = (
+            tuple(_round(v) for v in self.exclude_hsv) if self.exclude_hsv is not None else None
+        )
+        return (
+            int(self.r.get()),
+            int(self.g.get()),
+            int(self.b.get()),
+            int(self.a.get()),
+            self.keep.get(),
+            _round(self.sat.get()),
+            self.alpha_mode.get(),
+            _round(self.tone.get()),
+            _round(self.gamma.get()),
+            bool(self.range_enable.get()),
+            include_base,
+            include_hsv,
+            int(self.range_h_tol.get()),
+            int(self.range_s_tol.get()),
+            int(self.range_v_tol.get()),
+            bool(self.exclude_enable.get()),
+            exclude_base,
+            exclude_hsv,
+            int(self.exclude_h_tol.get()),
+            int(self.exclude_s_tol.get()),
+            int(self.exclude_v_tol.get()),
+        )
+
+    def _ensure_precomputed(self, image_np, cache, quality, color_threshold, exclude_threshold):
+        signature = self._current_recolor_signature()
+        attr = '_tint_full_cache' if quality == 'full' else '_tint_draft_cache'
+        store = getattr(self, attr)
+        if (
+            store is None
+            or store.get('image_id') != self._image_serial
+            or store.get('signature') != signature
+        ):
+            src, tinted, gate = recolor_precompute(
+                image_np,
+                (self.r.get(), self.g.get(), self.b.get(), self.a.get()),
+                keep=self.keep.get(),
+                saturation_scale=float(self.sat.get()),
+                alpha_mode=self.alpha_mode.get(),
+                tone_blend=float(self.tone.get()),
+                shade_gamma=float(self.gamma.get()),
+                color_threshold=color_threshold,
+                exclude_threshold=exclude_threshold,
+                cache=cache,
+            )
+            store = {
+                'image_id': self._image_serial,
+                'signature': signature,
+                'src': src,
+                'tinted': tinted,
+                'gate': gate,
+            }
+            setattr(self, attr, store)
+        return store
 
     def _resample_mask_to(self, mask, target_shape):
         if mask is None:
@@ -497,10 +644,18 @@ class App(tk.Tk):
                 self.after_cancel(self._full_quality_job)
             except tk.TclError:
                 pass
-        self._full_quality_job = self.after(
-            self._full_preview_delay_ms,
-            lambda g=generation: self._run_preview(generation=g, quality="full"),
-        )
+        self._full_quality_job = None
+        delay = max(0, self._full_preview_delay_ms)
+        if delay <= 0:
+            self._full_quality_job = self.after(
+                0,
+                lambda g=generation: self._run_preview(generation=g, quality="full"),
+            )
+        else:
+            self._full_quality_job = self.after(
+                delay,
+                lambda g=generation: self._run_preview(generation=g, quality="full"),
+            )
 
     def _draw_thumb(self, canvas, npimg):
         if npimg is None: return
@@ -546,12 +701,19 @@ class App(tk.Tk):
             self.status.set(f"Tool: {name}. Left drag. Right=pan. Scroll=zoom.")
             return
         if self.mask is None: return
-        if name=="Invert": self.mask.invert()
+        changed = False
+        if name=="Invert":
+            self.mask.invert(); changed = True
         elif name=="Clear":
-            self.mask.clear()
-        elif name=="Undo": self.mask.undo()
-        elif name=="Redo": self.mask.redo()
-        elif name=="Show/Hide": self._show_mask=not getattr(self,"_show_mask",True)
+            self.mask.clear(); changed = True
+        elif name=="Undo":
+            self.mask.undo(); changed = True
+        elif name=="Redo":
+            self.mask.redo(); changed = True
+        elif name=="Show/Hide":
+            self._show_mask=not getattr(self,"_show_mask",True)
+        if changed:
+            self._mark_mask_dirty()
         # After state changes, update preview and left
         self._update_canvas_cursor()
         self._render_live_preview()
@@ -568,9 +730,11 @@ class App(tk.Tk):
             sign=+1.0 if self._tool=="Brush" else -1.0
             shape = self.brush_shape.get() if self._tool=="Brush" else self.eraser_shape.get()
             self.mask.brush(ix,iy,self.brush_size.get(),self.feather.get(),sign=sign, shape=shape, snapshot=True)
+            self._mark_mask_dirty()
             self._render_live_preview()
         elif self._tool=="Wand":
             self.mask.magic_wand(self.orig_np, ix, iy, tolerance=self.tolerance.get(), sign=+1.0)
+            self._mark_mask_dirty()
             self._render_live_preview()
         elif self._tool in ("Rect","Ellipse"):
             self._rubber_bbox=(ix,iy,ix,iy); self._rubber_id=None
@@ -583,6 +747,7 @@ class App(tk.Tk):
             sign=+1.0 if self._tool=="Brush" else -1.0
             shape = self.brush_shape.get() if self._tool=="Brush" else self.eraser_shape.get()
             self.mask.brush(ix,iy,self.brush_size.get(),self.feather.get(),sign=sign, shape=shape, snapshot=False)
+            self._mark_mask_dirty()
             self._render_live_preview()
         elif self._tool in ("Rect","Ellipse") and self._rubber_bbox is not None:
             self._rubber_bbox=(self._x0,self._y0,ix,iy)
@@ -591,8 +756,10 @@ class App(tk.Tk):
     def on_up(self,e):
         if self.orig_np is None or self.mask is None: return
         ix,iy = self._event_to_img_xy(e)
-        if self._tool=="Rect": self.mask.rect(self._x0,self._y0,ix,iy,self.feather.get(),sign=+1.0)
-        elif self._tool=="Ellipse": self.mask.ellipse(self._x0,self._y0,ix,iy,self.feather.get(),sign=+1.0)
+        if self._tool=="Rect":
+            self.mask.rect(self._x0,self._y0,ix,iy,self.feather.get(),sign=+1.0); self._mark_mask_dirty()
+        elif self._tool=="Ellipse":
+            self.mask.ellipse(self._x0,self._y0,ix,iy,self.feather.get(),sign=+1.0); self._mark_mask_dirty()
         if self._rubber_id is not None:
             self.canvas.delete(self._rubber_id); self._rubber_id=None; self._rubber_bbox=None
         self._render_live_preview()  # final
@@ -611,12 +778,20 @@ class App(tk.Tk):
         self.preview()
         self._render_left(overlay_mask=temp)
 
+    def _on_recolor_param_change(self, *_):
+        self._invalidate_tint_cache()
+        self.preview()
+
+    def _on_recolor_param_change_event(self, *_):
+        self._on_recolor_param_change()
+
     # color + palette
     def pick_color(self):
         rgb,_ = colorchooser.askcolor()
         if rgb:
             r,g,b = map(int,rgb)
             self.r.set(r); self.g.set(g); self.b.set(b)
+            self._invalidate_tint_cache()
             self.preview()
 
     def _threshold_title(self, kind):
@@ -664,6 +839,7 @@ class App(tk.Tk):
         else:
             self.exclude_base=rgb; self.exclude_hsv=hsv_tuple
         self._update_threshold_widgets(kind)
+        self._invalidate_tint_cache()
         self.preview()
 
     def _update_threshold_widgets(self, kind):
@@ -687,8 +863,14 @@ class App(tk.Tk):
             vper=int(hsv[2]*100.0+0.5)
             info_var.set(f"{label} HSV: {hdeg}° / {sper}% / {vper}%")
 
-    def _on_threshold_change(self, _kind):
+    def _on_threshold_change(self, kind):
+        self._invalidate_tint_cache()
         self.preview()
+
+    def _on_threshold_toggle(self, kind):
+        self._invalidate_tint_cache()
+        self.preview()
+        self._update_threshold_widgets(kind)
 
     def _clear_palette_swatches(self):
         for child in list(self.pal_frame.pack_slaves()): child.destroy()
@@ -697,7 +879,9 @@ class App(tk.Tk):
         sw = tk.Canvas(self.pal_frame, width=40, height=20, highlightthickness=1, highlightbackground="#fff"); sw.pack(side="left", padx=4)
         sw.create_rectangle(0,0,40,20, fill=f"#{rgba[0]:02x}{rgba[1]:02x}{rgba[2]:02x}", outline="")
         def set_color(_evt=None, col=rgba):
-            self.r.set(int(col[0])); self.g.set(int(col[1])); self.b.set(int(col[2])); self.a.set(int(col[3])); self.preview()
+            self.r.set(int(col[0])); self.g.set(int(col[1])); self.b.set(int(col[2])); self.a.set(int(col[3]));
+            self._invalidate_tint_cache()
+            self.preview()
         sw.bind("<Button-1>", set_color)
 
     def extract_palette(self):
@@ -710,13 +894,15 @@ class App(tk.Tk):
         palO=extract_palette(self.orig_np,4); palR=extract_palette(self.ref_np,4)
         if not palO or not palR: return
         mapping=transfer_map(palO,palR); target=palR[mapping[0]][0]
-        self.r.set(int(target[0])); self.g.set(int(target[1])); self.b.set(int(target[2])); self.a.set(int(target[3])); self.preview()
+        self.r.set(int(target[0])); self.g.set(int(target[1])); self.b.set(int(target[2])); self.a.set(int(target[3]));
+        self._invalidate_tint_cache()
+        self.preview()
 
     # preview
-    def preview(self,*_, immediate=False):
+    def preview(self,*_, immediate=False, force_full=False):
         if self.orig_np is None:
             return
-        self._invalidate_preview(immediate=immediate)
+        self._invalidate_preview(immediate=immediate, force_full=force_full)
 
     def _cancel_preview_job(self):
         if self._preview_job is not None:
@@ -730,27 +916,22 @@ class App(tk.Tk):
             finally:
                 self._full_quality_job=None
 
-    def _invalidate_preview(self, immediate=False):
+    def _invalidate_preview(self, immediate=False, force_full=False):
         self.preview_dirty=True
         self._preview_generation += 1
         generation = self._preview_generation
         self._cancel_preview_job()
         if immediate:
-            self._run_preview(generation=generation, blocking=True, quality="full")
-        else:
-            self._preview_job = self.after(
-                self._preview_delay_ms,
-                lambda g=generation: self._run_preview(generation=g, quality="draft"),
-            )
-
-    def _resolve_mask(self):
-        if not self.apply_only.get() or self.mask is None:
-            return None
-        base = self.mask.alpha if self.mask.any_selected() else None
-        if base is None:
-            H,W,_=self.orig_np.shape
-            return np.zeros((H,W), dtype=np.float32)
-        return base
+            if force_full or self._draft_np is None:
+                quality = "full"
+            else:
+                quality = "draft"
+            self._run_preview(generation=generation, blocking=True, quality=quality)
+            return
+        preferred_quality = "draft" if self._draft_np is not None else "full"
+        if force_full:
+            preferred_quality = "full"
+        self._run_preview(generation=generation, blocking=True, quality=preferred_quality)
 
     def _current_threshold(self, kind="include"):
         enable = self.range_enable if kind=="include" else self.exclude_enable
@@ -773,7 +954,9 @@ class App(tk.Tk):
         self._preview_job=None
         if quality == "full":
             requested_quality = "full"
-        elif quality == "draft" and not blocking and self._draft_np is not None and self._draft_cache is not None:
+        elif quality == "draft" and self._draft_np is not None and self._draft_cache is not None:
+            requested_quality = "draft"
+        elif quality == "auto" and self._draft_np is not None and self._draft_cache is not None:
             requested_quality = "draft"
         else:
             requested_quality = "full"
@@ -786,29 +969,22 @@ class App(tk.Tk):
             image_np = self._draft_np
             cache = self._draft_cache
             mask_shape = image_np.shape[:2]
-            if not blocking:
-                self._queue_full_quality(generation)
+            self._queue_full_quality(generation)
         if self.orig_np is None or generation != self._preview_generation:
             return
-        tgt=(self.r.get(), self.g.get(), self.b.get(), self.a.get())
-        mask_to_use=self._resolve_mask()
-        mask_copy = None if mask_to_use is None else mask_to_use.astype(np.float32, copy=True)
-        if mask_shape is not None and mask_copy is not None:
-            mask_copy = self._resample_mask_to(mask_copy, mask_shape)
-        color_threshold=self._current_threshold("include")
-        exclude_threshold=self._current_threshold("exclude")
+        mask_array = self._mask_for_shape(mask_shape)
+        color_threshold = self._current_threshold("include")
+        exclude_threshold = self._current_threshold("exclude")
+        precomputed = self._ensure_precomputed(
+            image_np,
+            cache,
+            requested_quality,
+            color_threshold,
+            exclude_threshold,
+        )
         payload = {
-            'image': image_np,
-            'target_rgba': tgt,
-            'mask': mask_copy,
-            'keep': self.keep.get(),
-            'sat': self.sat.get(),
-            'alpha_mode': self.alpha_mode.get(),
-            'tone': self.tone.get(),
-            'gamma': self.gamma.get(),
-            'color_threshold': color_threshold,
-            'exclude_threshold': exclude_threshold,
-            'cache': cache,
+            'mask': mask_array,
+            'precomputed': precomputed,
             'quality': requested_quality,
         }
         if blocking or self._preview_worker is None:
@@ -827,18 +1003,12 @@ class App(tk.Tk):
             self._render_left()
 
     def _compute_preview(self, payload):
-        return recolor_rgba(
-            payload['image'],
-            payload['target_rgba'],
-            mask=payload['mask'],
-            keep=payload['keep'],
-            saturation_scale=payload['sat'],
-            alpha_mode=payload['alpha_mode'],
-            tone_blend=payload['tone'],
-            shade_gamma=payload['gamma'],
-            color_threshold=payload['color_threshold'],
-            exclude_threshold=payload['exclude_threshold'],
-            cache=payload.get('cache'),
+        store = payload['precomputed']
+        return apply_precomputed(
+            store['src'],
+            store['tinted'],
+            store['gate'],
+            mask=payload.get('mask'),
         )
 
     def _on_preview_ready(self, generation, image_id, out, quality="full"):
