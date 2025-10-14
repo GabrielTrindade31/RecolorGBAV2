@@ -84,6 +84,10 @@ class App(tk.Tk):
         self._full_preview_delay_ms = 0
         self._image_serial=0
         self._color_cache=None
+        self._instant_np=None
+        self._instant_cache=None
+        self._instant_scale=1.0
+        self._instant_pixel_cap=180_000
         self._draft_np=None
         self._draft_cache=None
         self._draft_scale=1.0
@@ -455,6 +459,9 @@ class App(tk.Tk):
         }
 
     def _setup_preview_buffers(self, npimg):
+        self._instant_np=None
+        self._instant_cache=None
+        self._instant_scale=1.0
         self._draft_np=None
         self._draft_cache=None
         self._draft_scale=1.0
@@ -462,6 +469,16 @@ class App(tk.Tk):
             return
         H,W,_ = npimg.shape
         total = H * W
+        if total > self._instant_pixel_cap:
+            instant_scale = math.sqrt(self._instant_pixel_cap / float(total))
+            instant_scale = max(0.1, min(instant_scale, 1.0))
+            inst_w = max(1, int(W * instant_scale))
+            inst_h = max(1, int(H * instant_scale))
+            if inst_w != W or inst_h != H:
+                down = Image.fromarray(npimg, mode="RGBA").resize((inst_w, inst_h), RESAMPLE_BILINEAR)
+                self._instant_np = np.array(down, dtype=np.uint8)
+                self._instant_cache = self._build_color_cache(self._instant_np)
+                self._instant_scale = instant_scale
         if total <= self._draft_pixel_cap:
             return
         scale = math.sqrt(self._draft_pixel_cap / float(total))
@@ -816,17 +833,27 @@ class App(tk.Tk):
         self._preview_generation += 1
         generation = self._preview_generation
         self._cancel_preview_job()
-        if immediate:
-            if force_full or self._draft_np is None:
-                quality = "full"
-            else:
-                quality = "draft"
-            self._run_preview(generation=generation, blocking=True, quality=quality)
+        if self.orig_np is None or not self.live_preview.get():
             return
-        preferred_quality = "draft" if self._draft_np is not None else "full"
         if force_full:
-            preferred_quality = "full"
-        self._run_preview(generation=generation, blocking=True, quality=preferred_quality)
+            immediate_quality = "full"
+        else:
+            if self._instant_np is not None and self._instant_cache is not None:
+                immediate_quality = "instant"
+            elif self._draft_np is not None and self._draft_cache is not None:
+                immediate_quality = "draft"
+            else:
+                immediate_quality = "full"
+        self._run_preview(generation=generation, blocking=True, quality=immediate_quality)
+        if force_full:
+            return
+        if immediate_quality == "instant":
+            if self._draft_np is not None and self._draft_cache is not None:
+                self._run_preview(generation=generation, quality="draft")
+            else:
+                self._run_preview(generation=generation, quality="full")
+        elif immediate_quality == "draft":
+            self._queue_full_quality(generation)
 
     def _current_threshold(self, kind="include"):
         enable = self.range_enable if kind=="include" else self.exclude_enable
@@ -849,10 +876,27 @@ class App(tk.Tk):
         self._preview_job=None
         if quality == "full":
             requested_quality = "full"
-        elif quality == "draft" and self._draft_np is not None and self._draft_cache is not None:
-            requested_quality = "draft"
-        elif quality == "auto" and self._draft_np is not None and self._draft_cache is not None:
-            requested_quality = "draft"
+        elif quality == "instant":
+            if self._instant_np is not None and self._instant_cache is not None:
+                requested_quality = "instant"
+            elif self._draft_np is not None and self._draft_cache is not None:
+                requested_quality = "draft"
+            else:
+                requested_quality = "full"
+        elif quality == "draft":
+            if self._draft_np is not None and self._draft_cache is not None:
+                requested_quality = "draft"
+            elif self._instant_np is not None and self._instant_cache is not None:
+                requested_quality = "instant"
+            else:
+                requested_quality = "full"
+        elif quality == "auto":
+            if self._instant_np is not None and self._instant_cache is not None:
+                requested_quality = "instant"
+            elif self._draft_np is not None and self._draft_cache is not None:
+                requested_quality = "draft"
+            else:
+                requested_quality = "full"
         else:
             requested_quality = "full"
         if requested_quality == "full":
@@ -860,11 +904,15 @@ class App(tk.Tk):
             cache = self._color_cache
             mask_shape = None
             self._full_quality_job = None
-        else:
+        elif requested_quality == "draft":
             image_np = self._draft_np
             cache = self._draft_cache
             mask_shape = image_np.shape[:2]
             self._queue_full_quality(generation)
+        else:
+            image_np = self._instant_np
+            cache = self._instant_cache
+            mask_shape = image_np.shape[:2] if image_np is not None else None
         if self.orig_np is None or generation != self._preview_generation:
             return
         tgt=(self.r.get(), self.g.get(), self.b.get(), self.a.get())
@@ -918,7 +966,7 @@ class App(tk.Tk):
     def _on_preview_ready(self, generation, image_id, out, quality="full"):
         if image_id != self._image_serial or generation != self._preview_generation:
             return
-        if quality == "draft":
+        if quality in ("draft", "instant"):
             out = self._upsample_preview(out)
         self.preview_np=out
         self._last_preview_quality = quality
