@@ -10,7 +10,7 @@ from tkinter import ttk, filedialog, colorchooser, messagebox
 from PIL import Image, ImageTk
 import numpy as np
 from .selection_mask import Mask
-from .colorops import recolor_rgba, rgb_to_hsv, luminance
+from .colorops import recolor_rgba, rgb_to_hsv, luminance, color_threshold_mask
 from .palette import extract_palette, transfer_map
 from .io_utils import pil_open, pil_to_np, np_to_pil
 
@@ -79,9 +79,9 @@ class App(tk.Tk):
         self._preview_job=None
         self._preview_worker=None
         self._preview_generation=0
-        self._preview_delay_ms = 90
+        self._preview_delay_ms = 0
         self._full_quality_job=None
-        self._full_preview_delay_ms = 240
+        self._full_preview_delay_ms = 0
         self._image_serial=0
         self._color_cache=None
         self._draft_np=None
@@ -89,6 +89,19 @@ class App(tk.Tk):
         self._draft_scale=1.0
         self._draft_pixel_cap=1_200_000
         self._last_preview_quality="full"
+        self._mask_edit_serial = 0
+        self._mask_cache_full = None
+        self._mask_cache_serial = -1
+        self._mask_resampled = {}
+        self._mask_last_has_selection = False
+        self._weight_cache = {q: {'key': None, 'map': None} for q in ("full", "draft")}
+        self._threshold_cache = {
+            q: {
+                'include': {'key': None, 'mask': None},
+                'exclude': {'key': None, 'mask': None, 'inverse': None},
+            }
+            for q in ("full", "draft")
+        }
 
         geometry = self._prefs.get("geometry", "1400x860")
         self.title("Recolor RGBA — Pro v1.0")
@@ -237,7 +250,7 @@ class App(tk.Tk):
         ttk.Button(lf,text="Load Original…",command=self.load_original).pack(side="left",padx=3)
         ttk.Button(lf,text="Load Reference…",command=self.load_reference).pack(side="left",padx=3)
         ttk.Button(lf,text="Save PNG…",command=self.save_png).pack(side="left",padx=3)
-        ttk.Checkbutton(lf, text="Apply to selection only", variable=self.apply_only, command=self.preview).pack(side="left", padx=12)
+        ttk.Checkbutton(lf, text="Apply to selection only", variable=self.apply_only, command=self._on_apply_only_toggle).pack(side="left", padx=12)
         ttk.Checkbutton(lf, text="Live preview", variable=self.live_preview, command=self._on_live_preview_toggle).pack(side="left", padx=12)
 
         ttk.Label(self, textvariable=self.status).pack(fill="x", side="bottom")
@@ -387,7 +400,9 @@ class App(tk.Tk):
         if not p: return
         im=pil_open(p); npimg=pil_to_np(im); self.orig_np=npimg; H,W,_=npimg.shape
         self.mask=Mask(H,W)
+        self._mark_mask_dirty()
         self._color_cache = self._build_color_cache(npimg)
+        self._clear_threshold_cache()
         self._setup_preview_buffers(npimg)
         self._last_preview_quality = "full"
         self._image_serial += 1
@@ -420,7 +435,7 @@ class App(tk.Tk):
         self.ref_np=pil_to_np(pil_open(p)); self._draw_thumb(self.thumb_ref, self.ref_np); self._clear_palette_swatches()
 
     def save_png(self):
-        if self.preview_np is None or self.preview_dirty: self.preview(immediate=True)
+        if self.preview_np is None or self.preview_dirty: self.preview(immediate=True, force_full=True)
         p=filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG","*.png")])
         if not p: return
         np_to_pil(self.preview_np).save(p)
@@ -452,6 +467,8 @@ class App(tk.Tk):
         self._draft_np=None
         self._draft_cache=None
         self._draft_scale=1.0
+        self._clear_weight_cache()
+        self._clear_threshold_cache()
         if npimg is None:
             return
         H,W,_ = npimg.shape
@@ -468,6 +485,162 @@ class App(tk.Tk):
         self._draft_np = np.array(down, dtype=np.uint8)
         self._draft_cache = self._build_color_cache(self._draft_np)
         self._draft_scale = scale
+
+    def _mark_mask_dirty(self):
+        self._mask_edit_serial += 1
+        self._mask_cache_full = None
+        self._mask_cache_serial = -1
+        self._mask_resampled.clear()
+        self._mask_last_has_selection = False
+        self._clear_weight_cache()
+
+    def _clear_weight_cache(self):
+        for slot in self._weight_cache.values():
+            slot['key'] = None
+            slot['map'] = None
+
+    def _clear_threshold_cache(self):
+        for quality in self._threshold_cache.values():
+            include_slot = quality['include']
+            include_slot['key'] = None
+            include_slot['mask'] = None
+            exclude_slot = quality['exclude']
+            exclude_slot['key'] = None
+            exclude_slot['mask'] = None
+            exclude_slot['inverse'] = None
+
+    def _threshold_key(self, threshold):
+        if threshold is None:
+            return None
+        base = threshold.get('base')
+        hsv = threshold.get('base_hsv')
+        return (
+            tuple(int(x) for x in base) if base is not None else None,
+            tuple(float(x) for x in hsv) if hsv is not None else None,
+            float(threshold.get('h_tolerance', 0.0)),
+            float(threshold.get('s_tolerance', 0.0)),
+            float(threshold.get('v_tolerance', 0.0)),
+        )
+
+    def _threshold_mask(self, cache, threshold, quality_key, kind):
+        if threshold is None or cache is None:
+            slot = self._threshold_cache[quality_key][kind]
+            slot['key'] = None
+            slot['mask'] = None
+            if 'inverse' in slot:
+                slot['inverse'] = None
+            return None
+        key = self._threshold_key(threshold)
+        slot = self._threshold_cache[quality_key][kind]
+        cache_key = (self._image_serial, cache['h'].shape, key)
+        if slot['key'] == cache_key and slot['mask'] is not None:
+            if kind == 'exclude':
+                return slot.get('inverse')
+            return slot['mask']
+        mask = color_threshold_mask(
+            cache['h'], cache['s'], cache['v'],
+            threshold['base'],
+            threshold.get('h_tolerance', 0.0),
+            threshold.get('s_tolerance', 0.0),
+            threshold.get('v_tolerance', 0.0),
+            base_hsv=threshold.get('base_hsv')
+        )
+        slot['key'] = cache_key
+        slot['mask'] = mask
+        if kind == 'exclude':
+            inverse = np.clip(1.0 - mask, 0.0, 1.0)
+            slot['inverse'] = inverse
+            return inverse
+        return mask
+
+    def _combined_weight_map(self, image_shape, mask_array, include_threshold, exclude_threshold, cache, quality):
+        quality_key = "draft" if quality == "draft" else "full"
+        if cache is None and ((include_threshold and include_threshold.get('base')) or (exclude_threshold and exclude_threshold.get('base'))):
+            return None
+        include_key = self._threshold_key(include_threshold)
+        exclude_key = self._threshold_key(exclude_threshold)
+        mask_serial = self._mask_cache_serial if mask_array is not None else -1
+        apply_flag = bool(self.apply_only.get())
+        shape_key = tuple(int(x) for x in image_shape)
+        cache_key = (self._image_serial, shape_key, mask_serial, apply_flag, include_key, exclude_key)
+        slot = self._weight_cache[quality_key]
+        if slot['key'] == cache_key:
+            return slot['map']
+        if mask_array is None and include_key is None and exclude_key is None:
+            result = None
+        else:
+            if mask_array is None:
+                wgt = np.ones(image_shape, dtype=np.float32)
+                wgt_is_copy = True
+            else:
+                wgt = np.asarray(mask_array, dtype=np.float32)
+                if wgt.shape != image_shape:
+                    raise ValueError("mask shape must match image dimensions")
+                wgt_is_copy = False
+            include_mult = self._threshold_mask(cache, include_threshold, quality_key, 'include')
+            if include_mult is not None:
+                if not wgt_is_copy:
+                    wgt = wgt.copy()
+                    wgt_is_copy = True
+                np.multiply(wgt, include_mult, out=wgt)
+            exclude_mult = self._threshold_mask(cache, exclude_threshold, quality_key, 'exclude')
+            if exclude_mult is not None:
+                if not wgt_is_copy:
+                    wgt = wgt.copy()
+                    wgt_is_copy = True
+                np.multiply(wgt, exclude_mult, out=wgt)
+            result = wgt
+        slot['key'] = cache_key
+        slot['map'] = result
+        return result
+
+    def _mask_empty_for_shape(self, shape):
+        shape_key = tuple(int(v) for v in shape)
+        key = ("empty", shape_key)
+        cached = self._mask_resampled.get(key)
+        if cached is not None and cached[0] == self._mask_edit_serial:
+            return cached[1]
+        arr = np.zeros(shape_key, dtype=np.float32)
+        self._mask_resampled[key] = (self._mask_edit_serial, arr)
+        return arr
+
+    def _mask_full_array(self):
+        if self.mask is None or self.orig_np is None:
+            return None
+        has_selection = self.mask.any_selected()
+        self._mask_last_has_selection = has_selection
+        base_shape = self.mask.alpha.shape
+        if not has_selection:
+            empty = self._mask_empty_for_shape(base_shape)
+            self._mask_cache_full = empty
+            self._mask_cache_serial = self._mask_edit_serial
+            return empty
+        if self._mask_cache_full is None or self._mask_cache_serial != self._mask_edit_serial:
+            self._mask_cache_full = self.mask.alpha.astype(np.float32, copy=True)
+            self._mask_cache_serial = self._mask_edit_serial
+        return self._mask_cache_full
+
+    def _mask_for_shape(self, target_shape=None):
+        if self.mask is None or self.orig_np is None or not self.apply_only.get():
+            return None
+        base = self._mask_full_array()
+        if base is None:
+            return None
+        if target_shape is None:
+            return base
+        target_key = tuple(int(v) for v in target_shape)
+        if base.shape == target_key:
+            return base
+        key = ("resampled", target_key)
+        cached = self._mask_resampled.get(key)
+        if cached is not None and cached[0] == self._mask_cache_serial:
+            return cached[1]
+        if not self._mask_last_has_selection:
+            resampled = self._mask_empty_for_shape(target_key)
+        else:
+            resampled = self._resample_mask_to(base, target_key)
+        self._mask_resampled[key] = (self._mask_cache_serial, resampled)
+        return resampled
 
     def _resample_mask_to(self, mask, target_shape):
         if mask is None:
@@ -497,10 +670,18 @@ class App(tk.Tk):
                 self.after_cancel(self._full_quality_job)
             except tk.TclError:
                 pass
-        self._full_quality_job = self.after(
-            self._full_preview_delay_ms,
-            lambda g=generation: self._run_preview(generation=g, quality="full"),
-        )
+        self._full_quality_job = None
+        delay = max(0, self._full_preview_delay_ms)
+        if delay <= 0:
+            self._full_quality_job = self.after(
+                0,
+                lambda g=generation: self._run_preview(generation=g, quality="full"),
+            )
+        else:
+            self._full_quality_job = self.after(
+                delay,
+                lambda g=generation: self._run_preview(generation=g, quality="full"),
+            )
 
     def _draw_thumb(self, canvas, npimg):
         if npimg is None: return
@@ -546,12 +727,19 @@ class App(tk.Tk):
             self.status.set(f"Tool: {name}. Left drag. Right=pan. Scroll=zoom.")
             return
         if self.mask is None: return
-        if name=="Invert": self.mask.invert()
+        changed = False
+        if name=="Invert":
+            self.mask.invert(); changed = True
         elif name=="Clear":
-            self.mask.clear()
-        elif name=="Undo": self.mask.undo()
-        elif name=="Redo": self.mask.redo()
-        elif name=="Show/Hide": self._show_mask=not getattr(self,"_show_mask",True)
+            self.mask.clear(); changed = True
+        elif name=="Undo":
+            self.mask.undo(); changed = True
+        elif name=="Redo":
+            self.mask.redo(); changed = True
+        elif name=="Show/Hide":
+            self._show_mask=not getattr(self,"_show_mask",True)
+        if changed:
+            self._mark_mask_dirty()
         # After state changes, update preview and left
         self._update_canvas_cursor()
         self._render_live_preview()
@@ -568,9 +756,11 @@ class App(tk.Tk):
             sign=+1.0 if self._tool=="Brush" else -1.0
             shape = self.brush_shape.get() if self._tool=="Brush" else self.eraser_shape.get()
             self.mask.brush(ix,iy,self.brush_size.get(),self.feather.get(),sign=sign, shape=shape, snapshot=True)
+            self._mark_mask_dirty()
             self._render_live_preview()
         elif self._tool=="Wand":
             self.mask.magic_wand(self.orig_np, ix, iy, tolerance=self.tolerance.get(), sign=+1.0)
+            self._mark_mask_dirty()
             self._render_live_preview()
         elif self._tool in ("Rect","Ellipse"):
             self._rubber_bbox=(ix,iy,ix,iy); self._rubber_id=None
@@ -583,6 +773,7 @@ class App(tk.Tk):
             sign=+1.0 if self._tool=="Brush" else -1.0
             shape = self.brush_shape.get() if self._tool=="Brush" else self.eraser_shape.get()
             self.mask.brush(ix,iy,self.brush_size.get(),self.feather.get(),sign=sign, shape=shape, snapshot=False)
+            self._mark_mask_dirty()
             self._render_live_preview()
         elif self._tool in ("Rect","Ellipse") and self._rubber_bbox is not None:
             self._rubber_bbox=(self._x0,self._y0,ix,iy)
@@ -591,8 +782,10 @@ class App(tk.Tk):
     def on_up(self,e):
         if self.orig_np is None or self.mask is None: return
         ix,iy = self._event_to_img_xy(e)
-        if self._tool=="Rect": self.mask.rect(self._x0,self._y0,ix,iy,self.feather.get(),sign=+1.0)
-        elif self._tool=="Ellipse": self.mask.ellipse(self._x0,self._y0,ix,iy,self.feather.get(),sign=+1.0)
+        if self._tool=="Rect":
+            self.mask.rect(self._x0,self._y0,ix,iy,self.feather.get(),sign=+1.0); self._mark_mask_dirty()
+        elif self._tool=="Ellipse":
+            self.mask.ellipse(self._x0,self._y0,ix,iy,self.feather.get(),sign=+1.0); self._mark_mask_dirty()
         if self._rubber_id is not None:
             self.canvas.delete(self._rubber_id); self._rubber_id=None; self._rubber_bbox=None
         self._render_live_preview()  # final
@@ -690,6 +883,10 @@ class App(tk.Tk):
     def _on_threshold_change(self, _kind):
         self.preview()
 
+    def _on_apply_only_toggle(self):
+        self._clear_weight_cache()
+        self.preview()
+
     def _clear_palette_swatches(self):
         for child in list(self.pal_frame.pack_slaves()): child.destroy()
 
@@ -713,10 +910,10 @@ class App(tk.Tk):
         self.r.set(int(target[0])); self.g.set(int(target[1])); self.b.set(int(target[2])); self.a.set(int(target[3])); self.preview()
 
     # preview
-    def preview(self,*_, immediate=False):
+    def preview(self,*_, immediate=False, force_full=False):
         if self.orig_np is None:
             return
-        self._invalidate_preview(immediate=immediate)
+        self._invalidate_preview(immediate=immediate, force_full=force_full)
 
     def _cancel_preview_job(self):
         if self._preview_job is not None:
@@ -730,27 +927,22 @@ class App(tk.Tk):
             finally:
                 self._full_quality_job=None
 
-    def _invalidate_preview(self, immediate=False):
+    def _invalidate_preview(self, immediate=False, force_full=False):
         self.preview_dirty=True
         self._preview_generation += 1
         generation = self._preview_generation
         self._cancel_preview_job()
         if immediate:
-            self._run_preview(generation=generation, blocking=True, quality="full")
-        else:
-            self._preview_job = self.after(
-                self._preview_delay_ms,
-                lambda g=generation: self._run_preview(generation=g, quality="draft"),
-            )
-
-    def _resolve_mask(self):
-        if not self.apply_only.get() or self.mask is None:
-            return None
-        base = self.mask.alpha if self.mask.any_selected() else None
-        if base is None:
-            H,W,_=self.orig_np.shape
-            return np.zeros((H,W), dtype=np.float32)
-        return base
+            if force_full or self._draft_np is None:
+                quality = "full"
+            else:
+                quality = "draft"
+            self._run_preview(generation=generation, blocking=True, quality=quality)
+            return
+        preferred_quality = "draft" if self._draft_np is not None else "full"
+        if force_full:
+            preferred_quality = "full"
+        self._run_preview(generation=generation, blocking=True, quality=preferred_quality)
 
     def _current_threshold(self, kind="include"):
         enable = self.range_enable if kind=="include" else self.exclude_enable
@@ -773,7 +965,9 @@ class App(tk.Tk):
         self._preview_job=None
         if quality == "full":
             requested_quality = "full"
-        elif quality == "draft" and not blocking and self._draft_np is not None and self._draft_cache is not None:
+        elif quality == "draft" and self._draft_np is not None and self._draft_cache is not None:
+            requested_quality = "draft"
+        elif quality == "auto" and self._draft_np is not None and self._draft_cache is not None:
             requested_quality = "draft"
         else:
             requested_quality = "full"
@@ -786,21 +980,25 @@ class App(tk.Tk):
             image_np = self._draft_np
             cache = self._draft_cache
             mask_shape = image_np.shape[:2]
-            if not blocking:
-                self._queue_full_quality(generation)
+            self._queue_full_quality(generation)
         if self.orig_np is None or generation != self._preview_generation:
             return
         tgt=(self.r.get(), self.g.get(), self.b.get(), self.a.get())
-        mask_to_use=self._resolve_mask()
-        mask_copy = None if mask_to_use is None else mask_to_use.astype(np.float32, copy=True)
-        if mask_shape is not None and mask_copy is not None:
-            mask_copy = self._resample_mask_to(mask_copy, mask_shape)
+        mask_array = self._mask_for_shape(mask_shape)
         color_threshold=self._current_threshold("include")
         exclude_threshold=self._current_threshold("exclude")
+        weight_map = self._combined_weight_map(
+            image_np.shape[:2],
+            mask_array,
+            color_threshold,
+            exclude_threshold,
+            cache,
+            requested_quality,
+        )
         payload = {
             'image': image_np,
             'target_rgba': tgt,
-            'mask': mask_copy,
+            'mask': mask_array,
             'keep': self.keep.get(),
             'sat': self.sat.get(),
             'alpha_mode': self.alpha_mode.get(),
@@ -810,6 +1008,7 @@ class App(tk.Tk):
             'exclude_threshold': exclude_threshold,
             'cache': cache,
             'quality': requested_quality,
+            'weight_map': weight_map,
         }
         if blocking or self._preview_worker is None:
             result = self._compute_preview(payload)
@@ -839,6 +1038,7 @@ class App(tk.Tk):
             color_threshold=payload['color_threshold'],
             exclude_threshold=payload['exclude_threshold'],
             cache=payload.get('cache'),
+            weight_map=payload.get('weight_map'),
         )
 
     def _on_preview_ready(self, generation, image_id, out, quality="full"):
