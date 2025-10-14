@@ -79,9 +79,9 @@ class App(tk.Tk):
         self._preview_job=None
         self._preview_worker=None
         self._preview_generation=0
-        self._preview_delay_ms = 90
+        self._preview_delay_ms = 0
         self._full_quality_job=None
-        self._full_preview_delay_ms = 240
+        self._full_preview_delay_ms = 0
         self._image_serial=0
         self._color_cache=None
         self._draft_np=None
@@ -497,10 +497,18 @@ class App(tk.Tk):
                 self.after_cancel(self._full_quality_job)
             except tk.TclError:
                 pass
-        self._full_quality_job = self.after(
-            self._full_preview_delay_ms,
-            lambda g=generation: self._run_preview(generation=g, quality="full"),
-        )
+        self._full_quality_job = None
+        delay = max(0, self._full_preview_delay_ms)
+        if delay <= 0:
+            self._full_quality_job = self.after(
+                0,
+                lambda g=generation: self._run_preview(generation=g, quality="full"),
+            )
+        else:
+            self._full_quality_job = self.after(
+                delay,
+                lambda g=generation: self._run_preview(generation=g, quality="full"),
+            )
 
     def _draw_thumb(self, canvas, npimg):
         if npimg is None: return
@@ -737,11 +745,9 @@ class App(tk.Tk):
         self._cancel_preview_job()
         if immediate:
             self._run_preview(generation=generation, blocking=True, quality="full")
-        else:
-            self._preview_job = self.after(
-                self._preview_delay_ms,
-                lambda g=generation: self._run_preview(generation=g, quality="draft"),
-            )
+            return
+        preferred_quality = "draft" if self._draft_np is not None else "full"
+        self._run_preview(generation=generation, blocking=True, quality=preferred_quality)
 
     def _resolve_mask(self):
         if not self.apply_only.get() or self.mask is None:
@@ -773,7 +779,9 @@ class App(tk.Tk):
         self._preview_job=None
         if quality == "full":
             requested_quality = "full"
-        elif quality == "draft" and not blocking and self._draft_np is not None and self._draft_cache is not None:
+        elif quality == "draft" and self._draft_np is not None and self._draft_cache is not None:
+            requested_quality = "draft"
+        elif quality == "auto" and self._draft_np is not None and self._draft_cache is not None:
             requested_quality = "draft"
         else:
             requested_quality = "full"
@@ -786,8 +794,7 @@ class App(tk.Tk):
             image_np = self._draft_np
             cache = self._draft_cache
             mask_shape = image_np.shape[:2]
-            if not blocking:
-                self._queue_full_quality(generation)
+            self._queue_full_quality(generation)
         if self.orig_np is None or generation != self._preview_generation:
             return
         tgt=(self.r.get(), self.g.get(), self.b.get(), self.a.get())
