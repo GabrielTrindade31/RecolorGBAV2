@@ -20,14 +20,35 @@ class Mask:
         self.snapshot(); self.alpha[:] = 1.0 - self.alpha
     @staticmethod
     def _cos_ramp(t): return 0.5 - 0.5*np.cos(np.clip(t,0,1)*np.pi)
-    def brush(self, cx, cy, radius, feather, sign=+1.0):
+    def brush(self, cx, cy, radius, feather, sign=+1.0, shape="circle"):
         self.snapshot()
-        h,w=self.alpha.shape; y,x=np.ogrid[:h,:w]
-        dist=np.sqrt((x-cx)**2+(y-cy)**2); RR=max(1,int(radius)); inner=max(1, RR - max(0,int(feather)))
-        ring=dist<=RR; a=np.zeros_like(self.alpha, dtype=np.float32); a[ring]=1.0
-        soft=(dist>inner)&ring
-        if RR>inner:
-            t=(dist[soft]-inner)/(RR-inner+1e-6); a[soft]=self._cos_ramp(1.0 - t)
+        h,w=self.alpha.shape
+        RR=max(1,int(radius))
+        f=max(0,int(feather))
+        if shape.lower()=="square":
+            y,x=np.ogrid[:h,:w]
+            dist=np.maximum(np.abs(x-cx), np.abs(y-cy))
+            inner=max(0, RR - f)
+            a=np.zeros_like(self.alpha, dtype=np.float32)
+            ring=dist<=RR
+            a[ring]=1.0
+            if RR>inner:
+                soft=(dist>inner)&ring
+                if soft.any():
+                    t=(dist[soft]-inner)/(RR-inner+1e-6)
+                    a[soft]=self._cos_ramp(1.0 - t)
+        else:
+            y,x=np.ogrid[:h,:w]
+            dist=np.sqrt((x-cx)**2+(y-cy)**2)
+            inner=max(1, RR - f)
+            ring=dist<=RR
+            a=np.zeros_like(self.alpha, dtype=np.float32)
+            a[ring]=1.0
+            if RR>inner:
+                soft=(dist>inner)&ring
+                if soft.any():
+                    t=(dist[soft]-inner)/(RR-inner+1e-6)
+                    a[soft]=self._cos_ramp(1.0 - t)
         self.alpha=np.clip(self.alpha + sign*a, 0,1)
     def _rect_alpha(self, x0,y0,x1,y1, feather):
         h,w=self.alpha.shape
