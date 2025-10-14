@@ -1,5 +1,23 @@
 from __future__ import annotations
 import numpy as np
+
+
+def color_threshold_mask(h, s, v, base_rgb, tol_h_deg, tol_s, tol_v):
+    base = np.array(base_rgb, dtype=np.float32) / 255.0
+    bh, bs, bv = rgb_to_hsv(np.array([base[0]]), np.array([base[1]]), np.array([base[2]]))
+    bh = bh[0]
+    bs = float(bs[0])
+    bv = float(bv[0])
+    tol_h = float(tol_h_deg) / 360.0
+    tol_s = float(tol_s)
+    tol_v = float(tol_v)
+    dh = np.abs(h - bh)
+    dh = np.minimum(dh, 1.0 - dh)
+    mask_h = dh <= tol_h
+    mask_s = np.abs(s - bs) <= tol_s
+    mask_v = np.abs(v - bv) <= tol_v
+    mask = mask_h & mask_s & mask_v
+    return mask.astype(np.float32)
 def rgb_to_hsv(r,g,b):
     mx=np.maximum.reduce([r,g,b]); mn=np.minimum.reduce([r,g,b])
     v=mx; d=mx-mn+1e-8; s=d/(mx+1e-8); h=np.zeros_like(mx)
@@ -25,7 +43,7 @@ def hue_weight(h,hmin,hmax,soft):
     w=np.maximum(fadeMin,fadeMax); w=np.where(core&(dmin>=soft)&(dmax>=soft),1.0,w); return w.astype(np.float32)
 def recolor_rgba(img_rgba, target_rgba, mask=None, keep='value', saturation_scale=1.0,
                  alpha_mode='preserve', hue_range=None, softness_deg=12.0,
-                 tone_blend=0.9, shade_gamma=1.0):
+                 tone_blend=0.9, shade_gamma=1.0, color_threshold=None):
     # Inputs
     src=img_rgba.astype(np.float32)/255.0
     r,g,b,a=src[...,0],src[...,1],src[...,2],src[...,3]
@@ -38,6 +56,12 @@ def recolor_rgba(img_rgba, target_rgba, mask=None, keep='value', saturation_scal
     if hue_range is not None:
         hmin=(hue_range[0]%360)/360.0; hmax=(hue_range[1]%360)/360.0
         wgt *= hue_weight(h,hmin,hmax,softness_deg/360.0)
+    if color_threshold is not None and color_threshold.get('base') is not None:
+        tol_h = color_threshold.get('h_tolerance', 0.0)
+        tol_s = color_threshold.get('s_tolerance', 0.0)
+        tol_v = color_threshold.get('v_tolerance', 0.0)
+        ct_mask = color_threshold_mask(h, s, v, color_threshold['base'], tol_h, tol_s, tol_v)
+        wgt *= ct_mask
     # If nothing is targeted, return original to avoid 'white-out'
     if wgt.sum() < 1e-6:
         out = src.copy()
