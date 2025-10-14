@@ -37,7 +37,8 @@ def srgb_to_linear(c): return np.where(c<=0.04045,c/12.92,((c+0.055)/1.055)**2.4
 def luminance(r,g,b): R=srgb_to_linear(r); G=srgb_to_linear(g); B=srgb_to_linear(b); return 0.2126*R+0.7152*G+0.0722*B
 def recolor_rgba(img_rgba, target_rgba, mask=None, keep='value', saturation_scale=1.0,
                  alpha_mode='preserve', tone_blend=0.9, shade_gamma=1.0,
-                 color_threshold=None, exclude_threshold=None, cache=None):
+                 color_threshold=None, exclude_threshold=None, cache=None,
+                 workspace=None):
     # Inputs
     if cache is not None:
         src = cache.get('src')
@@ -72,7 +73,14 @@ def recolor_rgba(img_rgba, target_rgba, mask=None, keep='value', saturation_scal
     th,ts,_=rgb_to_hsv(np.array([tr]),np.array([tg]),np.array([tb])); th=th[0]; ts=float(np.clip(ts[0]*saturation_scale,0,1))
     # Build weight map
     H,W=r.shape
-    wgt = np.ones((H,W), dtype=np.float32) if mask is None else mask.astype(np.float32)
+    if workspace is not None and workspace.shape == (H, W):
+        wgt = workspace
+        if mask is None:
+            wgt.fill(1.0)
+        else:
+            np.copyto(wgt, mask, casting='unsafe')
+    else:
+        wgt = np.ones((H,W), dtype=np.float32) if mask is None else mask.astype(np.float32)
     if cache is None:
         h,s,v=rgb_to_hsv(r,g,b)
     if color_threshold is not None and color_threshold.get('base') is not None:

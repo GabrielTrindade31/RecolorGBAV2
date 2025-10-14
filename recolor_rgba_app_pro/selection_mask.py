@@ -4,6 +4,13 @@ class Mask:
     def __init__(self, h, w):
         self.alpha = np.zeros((h,w), dtype=np.float32)
         self.undo_stack=[]; self.redo_stack=[]
+        self.version = 0
+
+    def _bump_version(self):
+        self.version = (self.version + 1) % (1 << 30)
+
+    def _mark_changed(self):
+        self._bump_version()
     def snapshot(self):
         self.undo_stack.append(self.alpha.copy())
         if len(self.undo_stack)>100: self.undo_stack.pop(0)
@@ -11,13 +18,17 @@ class Mask:
     def undo(self):
         if self.undo_stack:
             self.redo_stack.append(self.alpha.copy()); self.alpha=self.undo_stack.pop()
+            self._mark_changed()
     def redo(self):
         if self.redo_stack:
             self.undo_stack.append(self.alpha.copy()); self.alpha=self.redo_stack.pop()
+            self._mark_changed()
     def clear(self):
         self.snapshot(); self.alpha[:] = 0.0
+        self._mark_changed()
     def invert(self):
         self.snapshot(); self.alpha[:] = 1.0 - self.alpha
+        self._mark_changed()
     @staticmethod
     def _cos_ramp(t): return 0.5 - 0.5*np.cos(np.clip(t,0,1)*np.pi)
     def brush(self, cx, cy, radius, feather, sign=+1.0, shape="circle", snapshot=True):
@@ -69,6 +80,7 @@ class Mask:
                     a[soft] = self._cos_ramp(1.0 - t)
         updated = np.clip(sub + sign * a, 0.0, 1.0)
         self.alpha[y0:y1 + 1, x0:x1 + 1] = updated
+        self._mark_changed()
     def _rect_alpha(self, x0,y0,x1,y1, feather):
         h,w=self.alpha.shape
         x0,x1 = int(x0), int(x1); y0,y1=int(y0),int(y1)
@@ -92,6 +104,7 @@ class Mask:
         self.snapshot()
         a = self._rect_alpha(x0,y0,x1,y1, feather)
         self.alpha=np.clip(self.alpha + sign*a, 0,1)
+        self._mark_changed()
     def _ellipse_alpha(self, x0,y0,x1,y1, feather):
         h,w=self.alpha.shape
         x0,x1 = float(x0), float(x1); y0,y1=float(y0),float(y1)
@@ -110,19 +123,26 @@ class Mask:
         self.snapshot()
         a = self._ellipse_alpha(x0,y0,x1,y1, feather)
         self.alpha=np.clip(self.alpha + sign*a, 0,1)
+        self._mark_changed()
     def magic_wand(self, image_rgba, sx, sy, tolerance=24, sign=+1.0):
         import collections
         H,W,_=image_rgba.shape; sx=max(0,min(W-1,int(sx))); sy=max(0,min(H-1,int(sy)))
         seed=image_rgba[sy,sx,:3].astype(np.int32); tol2=(tolerance**2)*3
         q=collections.deque([(sx,sy)]); vis=np.zeros((H,W),dtype=np.uint8); a=self.alpha
         self.snapshot()
+        changed = False
         while q:
             x,y=q.popleft()
             if x<0 or y<0 or x>=W or y>=H or vis[y,x]: continue
             vis[y,x]=1; rgb=image_rgba[y,x,:3].astype(np.int32); d=((rgb-seed)**2).sum()
             if d<=tol2:
-                a[y,x]=np.clip(a[y,x]+sign*1.0,0,1)
+                new_val = np.clip(a[y,x]+sign*1.0,0,1)
+                if new_val != a[y,x]:
+                    changed = True
+                    a[y,x]=new_val
                 q.extend([(x+1,y),(x-1,y),(x,y+1),(x,y-1)])
+        if changed:
+            self._mark_changed()
     def any_selected(self): 
         return bool((self.alpha>0.001).any())
     def as_uint8_alpha(self):
